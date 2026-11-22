@@ -78,6 +78,7 @@ pub struct ModelInfo {
 pub struct ModelDetectionResult {
     pub info: ModelInfo,
     pub db_busy: bool,
+    pub model_from_db: bool,
 }
 
 pub fn normalize_model_slug(raw_name: &str) -> String {
@@ -582,6 +583,7 @@ pub fn detect_conversation_model(
     let (found_slugs, agy_max_token_limit, db_busy) =
         read_db_model_slugs(&db_path, 8, 5, true, true);
     let mut selected_slug = pick_selected_slug(&found_slugs);
+    let model_from_db = !selected_slug.is_empty();
 
     if selected_slug.is_empty()
         && let Ok(pbtxt) = std::fs::read_to_string(&pbtxt_path)
@@ -593,6 +595,7 @@ pub fn detect_conversation_model(
     ModelDetectionResult {
         info: resolve_model_context_limit(&selected_slug, agy_max_token_limit),
         db_busy,
+        model_from_db,
     }
 }
 

@@ -146,6 +146,7 @@ fn model_01_mapping_normalization_limits_and_pbtxt_fallback() {
         detect_conversation_model(&app_data, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", None);
     assert_eq!(detected.info.model_id, "claude-sonnet-4-6");
     assert!(!detected.db_busy);
+    assert!(!detected.model_from_db);
 
     // executor_metadata limit overrides fallback when DB is present
     let conv_id = "11111111-2222-3333-4444-555555555555";
@@ -184,6 +185,7 @@ fn model_01_mapping_normalization_limits_and_pbtxt_fallback() {
     assert_eq!(detected_db.info.model_id, "claude-opus-4-6");
     assert_eq!(detected_db.info.context_limit, 320_000);
     assert_eq!(detected_db.info.limit_source, "antigravity");
+    assert!(detected_db.model_from_db);
 }
 
 #[test]
@@ -1195,4 +1197,365 @@ fn mon_03_poller_populates_sidebar_model_labels_with_fingerprint_cache() {
     );
 
     drop(handle);
+}
+
+#[test]
+fn mon_04_pbtxt_fallback_isolated_from_sidebar_model_cache() {
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    let conv_dir = app.join("conversations");
+    std::fs::create_dir_all(&conv_dir).unwrap();
+
+    // Global pbtxt fallback maps MODEL_PLACEHOLDER_M26 -> "Claude Opus 4.6"
+    std::fs::write(
+        app.join("antigravity_state.pbtxt"),
+        "last_selected_agent_model: MODEL_PLACEHOLDER_M26\n",
+    )
+    .unwrap();
+
+    let id_x = "aaaaaaaa-0000-0000-0000-000000000010";
+    let id_y = "bbbbbbbb-0000-0000-0000-000000000020";
+    for (id, text) in [
+        (
+            id_x,
+            "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"session x\"}\n",
+        ),
+        (
+            id_y,
+            "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"session y\"}\n",
+        ),
+    ] {
+        let logs = app
+            .join("brain")
+            .join(id)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("transcript_full.jsonl"), text).unwrap();
+    }
+
+    // Session X has a DB with no model metadata; Session Y has Gemini 4 Hydrogen (High) in DB.
+    let db_x = conv_dir.join(format!("{id_x}.db"));
+    {
+        let conn_x = Connection::open(&db_x).unwrap();
+        conn_x
+            .execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);")
+            .unwrap();
+    }
+
+    let db_y = conv_dir.join(format!("{id_y}.db"));
+    {
+        let conn_y = Connection::open(&db_y).unwrap();
+        conn_y
+            .execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);")
+            .unwrap();
+        let mut step_model_y = Vec::new();
+        encode_varint_field(1, 1525, &mut step_model_y); // Gemini 4 Hydrogen (High)
+        let mut step_meta_y = Vec::new();
+        encode_bytes_field(24, &step_model_y, &mut step_meta_y);
+        conn_y
+            .execute(
+                "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+                [&step_meta_y],
+            )
+            .unwrap();
+    }
+
+    let mut cfg = MonitorConfig::new(GeminiPaths::from_gemini_dir(&gemini));
+    cfg.poll_interval = Duration::from_millis(60);
+    cfg.follow_latest = false;
+    let handle = MonitorHandle::start(cfg);
+
+    // (a) Select session X without DB model: right pane uses pbtxt fallback, sidebar stays "".
+    handle.send(MonitorCommand::SelectConversation(Some(id_x.to_string())));
+    let deadline_x = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline_x {
+        let snap = handle.snapshot();
+        if snap.selected_id.as_deref() == Some(id_x)
+            && snap
+                .analysis
+                .as_ref()
+                .is_some_and(|a| a.conversation_id == id_x)
+            && snap
+                .index
+                .by_id
+                .get(id_y)
+                .is_some_and(|s| s.model_label == "Gemini 4 Hydrogen (High)")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let snap_x = handle.snapshot();
+    assert_eq!(
+        snap_x
+            .analysis
+            .as_ref()
+            .map(|a| a.model.model_label.as_str()),
+        Some("Claude Opus 4.6"),
+        "right pane should still use pbtxt fallback for session X"
+    );
+    assert_eq!(
+        snap_x.index.by_id.get(id_x).map(|s| s.model_label.as_str()),
+        Some(""),
+        "session X without DB model must keep sidebar model_label empty while selected"
+    );
+    assert_eq!(
+        snap_x.index.by_id.get(id_y).map(|s| s.model_label.as_str()),
+        Some("Gemini 4 Hydrogen (High)")
+    );
+
+    // Switch to session Y: X keeps "", Y gets its DB model label.
+    handle.send(MonitorCommand::SelectConversation(Some(id_y.to_string())));
+    let deadline_y = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline_y {
+        let snap = handle.snapshot();
+        if snap.selected_id.as_deref() == Some(id_y)
+            && snap
+                .analysis
+                .as_ref()
+                .is_some_and(|a| a.conversation_id == id_y)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let snap_y = handle.snapshot();
+    assert_eq!(
+        snap_y
+            .analysis
+            .as_ref()
+            .map(|a| a.model.model_label.as_str()),
+        Some("Gemini 4 Hydrogen (High)")
+    );
+    assert_eq!(
+        snap_y.index.by_id.get(id_x).map(|s| s.model_label.as_str()),
+        Some(""),
+        "session X must retain empty sidebar model_label after switching to session Y"
+    );
+    assert_eq!(
+        snap_y.index.by_id.get(id_y).map(|s| s.model_label.as_str()),
+        Some("Gemini 4 Hydrogen (High)")
+    );
+
+    // (b) Switch away back to session X: Y retains its DB-derived model label in sidebar.
+    handle.send(MonitorCommand::SelectConversation(Some(id_x.to_string())));
+    let deadline_back_x = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline_back_x {
+        let snap = handle.snapshot();
+        if snap.selected_id.as_deref() == Some(id_x)
+            && snap
+                .analysis
+                .as_ref()
+                .is_some_and(|a| a.conversation_id == id_x)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let snap_back_x = handle.snapshot();
+    assert_eq!(
+        snap_back_x
+            .index
+            .by_id
+            .get(id_y)
+            .map(|s| s.model_label.as_str()),
+        Some("Gemini 4 Hydrogen (High)"),
+        "session Y must retain its DB-derived sidebar label after switching away"
+    );
+    assert_eq!(
+        snap_back_x
+            .index
+            .by_id
+            .get(id_x)
+            .map(|s| s.model_label.as_str()),
+        Some("")
+    );
+
+    // (c) Temporary exclusive lock on Y's DB while Y is selected must not wipe Y's cached label.
+    let lock_y = Connection::open(&db_y).unwrap();
+    lock_y.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+    handle.send(MonitorCommand::SelectConversation(Some(id_y.to_string())));
+    let deadline_locked = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline_locked {
+        let snap = handle.snapshot();
+        if snap.selected_id.as_deref() == Some(id_y)
+            && snap
+                .analysis
+                .as_ref()
+                .is_some_and(|a| a.conversation_id == id_y && a.db_busy)
+            && snap.db_busy
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let snap_locked = handle.snapshot();
+    assert!(
+        snap_locked.db_busy,
+        "expected db_busy while Y's DB is exclusively locked"
+    );
+    assert_eq!(
+        snap_locked
+            .index
+            .by_id
+            .get(id_y)
+            .map(|s| s.model_label.as_str()),
+        Some("Gemini 4 Hydrogen (High)"),
+        "exclusive lock on Y's DB must not wipe or overwrite Y's cached DB-derived sidebar label"
+    );
+
+    lock_y.execute_batch("COMMIT;").unwrap();
+    drop(lock_y);
+
+    let deadline_unlocked = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline_unlocked {
+        let snap = handle.snapshot();
+        if !snap.db_busy
+            && snap
+                .analysis
+                .as_ref()
+                .is_some_and(|a| a.conversation_id == id_y && !a.db_busy)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let snap_unlocked = handle.snapshot();
+    assert!(!snap_unlocked.db_busy);
+    assert_eq!(
+        snap_unlocked
+            .index
+            .by_id
+            .get(id_y)
+            .map(|s| s.model_label.as_str()),
+        Some("Gemini 4 Hydrogen (High)")
+    );
+
+    drop(handle);
+}
+
+#[test]
+fn mon_05_backfill_avoids_index_reloads_and_stops_on_busy_session() {
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    let conv_dir = app.join("conversations");
+    std::fs::create_dir_all(&conv_dir).unwrap();
+
+    let write_session = |id: &str, model_id: u64| -> std::path::PathBuf {
+        let logs = app
+            .join("brain")
+            .join(id)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("transcript_full.jsonl"),
+            format!("{{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"{id}\"}}\n"),
+        )
+        .unwrap();
+
+        let db_path = conv_dir.join(format!("{id}.db"));
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);")
+            .unwrap();
+        let mut step_model = Vec::new();
+        encode_varint_field(1, model_id, &mut step_model);
+        let mut step_meta = Vec::new();
+        encode_bytes_field(24, &step_model, &mut step_meta);
+        conn.execute(
+            "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+            [&step_meta],
+        )
+        .unwrap();
+        db_path
+    };
+
+    // 1 exclusively locked session created first, plus 45 unlocked sessions (> MAX_MODEL_SCANS_PER_TICK = 40).
+    let locked_id = "00000000-0000-0000-0000-000000000000";
+    let locked_db_path = write_session(locked_id, 1525);
+    let lock_conn = Connection::open(&locked_db_path).unwrap();
+    lock_conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+    let mut unlocked_ids = Vec::with_capacity(45);
+    for i in 1..=45usize {
+        let id = format!("11111111-0000-0000-0000-{i:012}");
+        write_session(&id, 1026); // Claude Opus 4.6
+        unlocked_ids.push(id);
+    }
+
+    let notify_count = Arc::new(AtomicUsize::new(0));
+    let notify_clone = Arc::clone(&notify_count);
+    let mut cfg = MonitorConfig::new(GeminiPaths::from_gemini_dir(&gemini));
+    cfg.poll_interval = Duration::from_secs(5);
+    cfg.notify = Some(Arc::new(move || {
+        notify_clone.fetch_add(1, Ordering::SeqCst);
+    }));
+    let handle = MonitorHandle::start(cfg);
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        let snap = handle.snapshot();
+        let all_unlocked_done = unlocked_ids.iter().all(|id| {
+            snap.index
+                .by_id
+                .get(id)
+                .is_some_and(|s| s.model_label == "Claude Opus 4.6")
+        });
+        if all_unlocked_done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+
+    let snap_done = handle.snapshot();
+    for id in &unlocked_ids {
+        assert_eq!(
+            snap_done
+                .index
+                .by_id
+                .get(id)
+                .map(|s| s.model_label.as_str()),
+            Some("Claude Opus 4.6"),
+            "session {id} should finish model backfill"
+        );
+    }
+    assert_eq!(
+        snap_done
+            .index
+            .by_id
+            .get(locked_id)
+            .map(|s| s.model_label.as_str()),
+        Some(""),
+        "exclusively locked session should stay empty without blocking backfill completion"
+    );
+    assert_eq!(
+        handle.index_reload_count(),
+        1,
+        "backfill ticks must not reload the session index"
+    );
+
+    // Wait for the final backfill tick's notify callback to finish before sampling.
+    let notify_deadline = Instant::now() + Duration::from_secs(1);
+    while notify_count.load(Ordering::SeqCst) < 2 && Instant::now() < notify_deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Confirm backfill stopped spinning at 50ms once only the locked session remained.
+    let notifications_at_done = notify_count.load(Ordering::SeqCst);
+    assert!(notifications_at_done >= 2);
+    std::thread::sleep(Duration::from_millis(350));
+    assert_eq!(
+        notify_count.load(Ordering::SeqCst),
+        notifications_at_done,
+        "backfill must stop spinning at 50ms once non-locked sessions complete"
+    );
+    assert_eq!(handle.index_reload_count(), 1);
+
+    drop(handle);
+    lock_conn.execute_batch("COMMIT;").unwrap();
+    drop(lock_conn);
 }

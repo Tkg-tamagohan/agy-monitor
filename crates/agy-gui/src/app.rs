@@ -552,12 +552,18 @@ impl AgyMonitorApp {
             };
 
             // Keep the monitor section fixed at the top while scrolling STEP details below.
-            // Only apply an upper height cap when narrow + short screens stack plots vertically.
-            if !side_by_side && avail_h < 620.0 {
+            // On narrow panes or short windows, bound the upper monitor height so the bottom detail tabs stay visible.
+            let reserved_detail_h = if avail_h < 320.0 {
+                avail_h * 0.45
+            } else {
+                (avail_h * 0.30).clamp(150.0, 220.0)
+            };
+            let max_monitor_h = (avail_h - reserved_detail_h).max(160.0);
+            if !side_by_side || avail_h < 680.0 {
                 egui::ScrollArea::vertical()
-                    .id_salt("monitor_compact_fallback")
+                    .id_salt("monitor_upper_scroll")
                     .auto_shrink([false, true])
-                    .max_height((avail_h - 160.0).max(180.0))
+                    .max_height(max_monitor_h)
                     .show(ui, |ui| {
                         render_monitor_section(ui, self);
                     });
@@ -1272,6 +1278,9 @@ fn session_matches_query(s: &SessionSummary, q: &str) -> bool {
         || s.project_label.to_lowercase().contains(q)
         || s.agent_name.to_lowercase().contains(q)
         || s.model_label.to_lowercase().contains(q)
+        || format_model_short_label(&s.model_label)
+            .to_lowercase()
+            .contains(q)
 }
 
 fn truncate_ui(text: &str, max_chars: usize) -> String {
@@ -1929,9 +1938,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn gui_06_step_scroll_keeps_monitor_and_plots_fixed() {
-        let (_tmp, mut app) = make_test_app();
+    fn sample_snapshot_with_60_steps() -> MonitorSnapshot {
         let mut snap = sample_snapshot();
         if let Some(a) = snap.analysis.as_mut() {
             a.step_summaries = (0..60)
@@ -1952,6 +1959,13 @@ mod tests {
                 .collect();
             a.step_count = 60;
         }
+        snap
+    }
+
+    #[test]
+    fn gui_06_step_scroll_keeps_monitor_and_plots_fixed() {
+        let (_tmp, mut app) = make_test_app();
+        let snap = sample_snapshot_with_60_steps();
 
         let ctx = egui::Context::default();
         install_japanese_fonts(&ctx);
@@ -2130,5 +2144,314 @@ mod tests {
             "model badge must stay single-line, got height={}",
             long_badge.height()
         );
+    }
+
+    #[test]
+    fn gui_08_narrow_pane_reserves_detail_tabs_and_step_scroll() {
+        let mut snap = sample_snapshot_with_60_steps();
+        let root_id = snap.selected_id.clone().unwrap();
+        let short_title = "狭幅ペイン検証";
+        if let Some(s) = snap.index.by_id.get_mut(&root_id) {
+            s.display_title = short_title.to_string();
+        }
+        if let Some(node) = snap.index.roots.first_mut() {
+            node.summary.display_title = short_title.to_string();
+        }
+
+        for viewport in [egui::vec2(580.0, 620.0), egui::vec2(620.0, 660.0)] {
+            let (_tmp, mut app) = make_test_app();
+            let ctx = egui::Context::default();
+            install_japanese_fonts(&ctx);
+            apply_theme(&ctx, ThemeMode::Dark);
+
+            let run_frame = |app: &mut AgyMonitorApp, events: Vec<egui::Event>| {
+                let raw_input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                    events,
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(raw_input, |ui| {
+                    app.render_ui(ui, &snap);
+                });
+                let texts = collect_rendered_texts(&output.shapes);
+                output.textures_delta.clear();
+                texts
+            };
+
+            let _ = run_frame(&mut app, vec![]);
+            let texts = run_frame(&mut app, vec![]);
+
+            // Sidebar must be visible alongside the narrow right pane
+            assert!(
+                texts
+                    .iter()
+                    .any(|(t, r, _)| r.left() < 280.0 && t.contains("agy-monitor")),
+                "expected sidebar visible at viewport {viewport:?}"
+            );
+
+            // Both detail tabs must fit within their clip rect (not pushed off the bottom)
+            for tab_label in ["ステップ明細 (60)", "重いツール Top 15 (1)"] {
+                let (_, rect, clip) = texts
+                    .iter()
+                    .find(|(t, _, _)| t == tab_label)
+                    .unwrap_or_else(|| {
+                        panic!("missing detail tab '{tab_label}' at viewport {viewport:?}")
+                    });
+                assert!(
+                    rect.top() >= clip.top() - 0.5 && rect.bottom() <= clip.bottom() + 0.5,
+                    "tab '{tab_label}' clipped at {viewport:?}: rect={rect:?}, clip={clip:?}"
+                );
+            }
+
+            // On Steps tab, step rows must have >= 80.0pt visible area and scroll on MouseWheel
+            let (_, step59_rect, step59_clip) = texts
+                .iter()
+                .find(|(t, r, _)| t == "59" && r.left() >= 280.0)
+                .unwrap_or_else(|| panic!("expected Step# 59 visible at {viewport:?}"));
+            assert!(
+                step59_clip.height() >= 80.0,
+                "steps area height too small at {viewport:?}: {}",
+                step59_clip.height()
+            );
+            assert!(
+                step59_rect.top() >= step59_clip.top() - 0.5
+                    && step59_rect.bottom() <= step59_clip.bottom() + 0.5,
+                "Step# 59 clipped at {viewport:?}: rect={step59_rect:?}, clip={step59_clip:?}"
+            );
+            let step59_y_before = step59_rect.top();
+
+            let hover_pos = step59_rect.center();
+            let _ = run_frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(hover_pos),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -240.0),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            let after_scroll = run_frame(&mut app, vec![]);
+            let step59_y_after = after_scroll
+                .iter()
+                .find(|(t, r, _)| t == "59" && r.left() >= 280.0)
+                .map(|(_, r, _)| r.top());
+            assert!(
+                step59_y_after.is_none_or(|y| y < step59_y_before - 20.0),
+                "expected step rows to scroll at {viewport:?} (before={step59_y_before}, after={step59_y_after:?})"
+            );
+
+            // Click "重いツール Top 15 (1)" and verify detail_tab switches
+            let heavy_pos = after_scroll
+                .iter()
+                .find(|(t, _, _)| t == "重いツール Top 15 (1)")
+                .expect("重いツール Top 15 (1) tab position")
+                .1
+                .center();
+            let _ = run_frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(heavy_pos),
+                    egui::Event::PointerButton {
+                        pos: heavy_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: heavy_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(
+                app.detail_tab,
+                DetailTab::HeavyTools,
+                "clicking '重いツール Top 15 (1)' must switch detail_tab at {viewport:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gui_09_sidebar_search_matches_short_model_labels() {
+        let base_snap = sample_snapshot();
+        let template = base_snap.index.roots[0].summary.clone();
+
+        let make_summary =
+            |id: &str, title: &str, project: &str, model_label: &str| SessionSummary {
+                conversation_id: id.to_string(),
+                title: title.to_string(),
+                display_title: title.to_string(),
+                root_session_id: id.to_string(),
+                root_title: title.to_string(),
+                project_id: project.to_string(),
+                project_key: project.to_string(),
+                project_label: project.to_string(),
+                model_label: model_label.to_string(),
+                ..template.clone()
+            };
+
+        let orch = make_summary(
+            "conv-orch-111",
+            "Alpha Architecture",
+            "proj-alpha",
+            "Orchestrator (Carbon)",
+        );
+        let flash = make_summary(
+            "conv-flash-222",
+            "Beta Subtask",
+            "proj-beta",
+            "Gemini Flash Worker",
+        );
+        let opus = make_summary(
+            "conv-opus-333",
+            "Gamma Deep Review",
+            "proj-gamma",
+            "Claude Opus 4.6 (High)",
+        );
+
+        // Unit checks on session_matches_query
+        assert!(session_matches_query(&orch, "orch (carbon)"));
+        assert!(!session_matches_query(&flash, "orch (carbon)"));
+        assert!(!session_matches_query(&opus, "orch (carbon)"));
+
+        assert!(session_matches_query(&flash, "flash worker"));
+        assert!(!session_matches_query(&orch, "flash worker"));
+
+        assert!(session_matches_query(&opus, "opus 4.6 (h)"));
+        assert!(!session_matches_query(&orch, "opus 4.6 (h)"));
+
+        assert!(session_matches_query(&orch, "orchestrator (carbon)"));
+        assert!(session_matches_query(&orch, "alpha architecture"));
+        assert!(session_matches_query(&flash, "conv-flash-222"));
+        assert!(session_matches_query(&opus, "proj-gamma"));
+
+        for s in [&orch, &flash, &opus] {
+            assert!(!session_matches_query(s, "nonexistent-model"));
+        }
+
+        // UI sidebar search checks with mixed case & substrings
+        let mut by_id = std::collections::HashMap::new();
+        for s in [&orch, &flash, &opus] {
+            by_id.insert(s.conversation_id.clone(), s.clone());
+        }
+        let mut snap = base_snap;
+        snap.index = SessionIndex {
+            projects: vec![],
+            roots: vec![
+                SessionTreeNode {
+                    summary: orch,
+                    children: vec![],
+                },
+                SessionTreeNode {
+                    summary: flash,
+                    children: vec![],
+                },
+                SessionTreeNode {
+                    summary: opus,
+                    children: vec![],
+                },
+            ],
+            by_id,
+            db_busy: false,
+        };
+        snap.selected_id = Some("conv-orch-111".to_string());
+        if let Some(a) = snap.analysis.as_mut() {
+            a.conversation_id = "conv-orch-111".to_string();
+        }
+
+        let (_tmp, mut app) = make_test_app();
+        let ctx = egui::Context::default();
+        install_japanese_fonts(&ctx);
+        apply_theme(&ctx, ThemeMode::Dark);
+
+        let run_search = |app: &mut AgyMonitorApp, query: &str| {
+            app.search_query = query.to_string();
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1240.0, 820.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw_input, |ui| {
+                app.render_ui(ui, &snap);
+            });
+            let texts = collect_rendered_texts(&output.shapes);
+            output.textures_delta.clear();
+            texts
+        };
+
+        let sidebar_has = |texts: &[(String, egui::Rect, egui::Rect)], needle: &str| {
+            texts
+                .iter()
+                .any(|(t, r, _)| r.left() < 280.0 && t.contains(needle))
+        };
+
+        for (query, expected_title, hidden_titles) in [
+            (
+                "Orch (Carbon)",
+                "Alpha Architecture",
+                &["Beta Subtask", "Gamma Deep Review"][..],
+            ),
+            (
+                "cArBoN",
+                "Alpha Architecture",
+                &["Beta Subtask", "Gamma Deep Review"][..],
+            ),
+            (
+                "Flash Worker",
+                "Beta Subtask",
+                &["Alpha Architecture", "Gamma Deep Review"][..],
+            ),
+            (
+                "Opus 4.6 (H)",
+                "Gamma Deep Review",
+                &["Alpha Architecture", "Beta Subtask"][..],
+            ),
+            (
+                "4.6 (h)",
+                "Gamma Deep Review",
+                &["Alpha Architecture", "Beta Subtask"][..],
+            ),
+            (
+                "Orchestrator (Carbon)",
+                "Alpha Architecture",
+                &["Beta Subtask", "Gamma Deep Review"][..],
+            ),
+            (
+                "conv-flash-222",
+                "Beta Subtask",
+                &["Alpha Architecture", "Gamma Deep Review"][..],
+            ),
+            (
+                "proj-gamma",
+                "Gamma Deep Review",
+                &["Alpha Architecture", "Beta Subtask"][..],
+            ),
+        ] {
+            let texts = run_search(&mut app, query);
+            assert!(
+                sidebar_has(&texts, expected_title),
+                "query {query:?} should match {expected_title:?}"
+            );
+            for hidden in hidden_titles {
+                assert!(
+                    !sidebar_has(&texts, hidden),
+                    "query {query:?} should not match {hidden:?}"
+                );
+            }
+        }
+
+        let none_texts = run_search(&mut app, "nonexistent-model");
+        assert!(sidebar_has(&none_texts, "一致するセッションがありません"));
+        for title in ["Alpha Architecture", "Beta Subtask", "Gamma Deep Review"] {
+            assert!(!sidebar_has(&none_texts, title));
+        }
     }
 }

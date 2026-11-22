@@ -333,11 +333,22 @@ pub fn analyze_conversation(
     explicit_context_limit: Option<u64>,
     pbtxt_override: Option<&Path>,
 ) -> std::result::Result<ConversationAnalysis, CoreError> {
+    analyze_conversation_with_meta(app_data, conv_id, explicit_context_limit, pbtxt_override)
+        .map(|(analysis, _)| analysis)
+}
+
+pub(crate) fn analyze_conversation_with_meta(
+    app_data: &Path,
+    conv_id: &str,
+    explicit_context_limit: Option<u64>,
+    pbtxt_override: Option<&Path>,
+) -> std::result::Result<(ConversationAnalysis, bool), CoreError> {
     if !is_valid_conv_id(conv_id) {
         return Err(CoreError::InvalidConversationId(conv_id.to_string()));
     }
 
     let model_res = detect_conversation_model(app_data, conv_id, pbtxt_override);
+    let model_from_db = model_res.model_from_db;
     let model_info = model_res.info;
     let context_limit = explicit_context_limit
         .filter(|&v| v > 0)
@@ -352,42 +363,45 @@ pub fn analyze_conversation(
     let steps = load_combined_steps(&full_path, &compact_path, &tfp);
 
     if !tfp.exists() && !conv_brain_dir.exists() {
-        return Ok(ConversationAnalysis {
-            conversation_id: conv_id.to_string(),
-            found: false,
-            exact: false,
-            model: model_info,
-            context_limit,
-            used_tokens: 0,
-            free_tokens: context_limit,
-            used_percent: 0.0,
-            step_count: 0,
-            planner_turn_count: 0,
-            last_step_at: None,
-            cache: CacheStats {
-                last_prompt_tokens: 0,
-                since_last_cache_tokens: 0,
-                cached_tokens: 0,
-                cache_hit_ratio: 0.0,
-                last_output_tokens: 0,
-                cumulative_input_tokens: 0,
-                cumulative_cached_tokens: 0,
-                session_cache_hit_ratio: 0.0,
-                cumulative_output_tokens: 0,
+        return Ok((
+            ConversationAnalysis {
+                conversation_id: conv_id.to_string(),
+                found: false,
+                exact: false,
+                model: model_info,
+                context_limit,
+                used_tokens: 0,
+                free_tokens: context_limit,
+                used_percent: 0.0,
+                step_count: 0,
+                planner_turn_count: 0,
+                last_step_at: None,
+                cache: CacheStats {
+                    last_prompt_tokens: 0,
+                    since_last_cache_tokens: 0,
+                    cached_tokens: 0,
+                    cache_hit_ratio: 0.0,
+                    last_output_tokens: 0,
+                    cumulative_input_tokens: 0,
+                    cumulative_cached_tokens: 0,
+                    session_cache_hit_ratio: 0.0,
+                    cumulative_output_tokens: 0,
+                },
+                compactions: Vec::new(),
+                total_saved_tokens: 0,
+                buckets: ContextBuckets {
+                    free_space: context_limit,
+                    ..Default::default()
+                },
+                turns_history: Vec::new(),
+                heavy_tool_calls: Vec::new(),
+                total_tool_calls: 0,
+                step_summaries: Vec::new(),
+                spawned_subagents: Vec::new(),
+                db_busy: model_res.db_busy,
             },
-            compactions: Vec::new(),
-            total_saved_tokens: 0,
-            buckets: ContextBuckets {
-                free_space: context_limit,
-                ..Default::default()
-            },
-            turns_history: Vec::new(),
-            heavy_tool_calls: Vec::new(),
-            total_tool_calls: 0,
-            step_summaries: Vec::new(),
-            spawned_subagents: Vec::new(),
-            db_busy: model_res.db_busy,
-        });
+            model_from_db,
+        ));
     }
 
     let mut planner_indices: Vec<usize> = Vec::new();
@@ -866,39 +880,42 @@ pub fn analyze_conversation(
     let step_summaries = build_step_summaries(&steps, &compacted_step_positions);
     let last_step_at = steps.last().and_then(|s| s.created_at.clone());
 
-    Ok(ConversationAnalysis {
-        conversation_id: conv_id.to_string(),
-        found: true,
-        exact: !planner_indices.is_empty() && !just_compacted_pending_planner,
-        model: model_info,
-        context_limit,
-        used_tokens,
-        free_tokens,
-        used_percent,
-        step_count: steps.len(),
-        planner_turn_count: planner_indices.len(),
-        last_step_at,
-        cache: CacheStats {
-            last_prompt_tokens: last_prompt_total,
-            since_last_cache_tokens: last_input_uncached,
-            cached_tokens: last_cache_read,
-            cache_hit_ratio: round_1dp(cache_hit_ratio_frac * 100.0),
-            last_output_tokens,
-            cumulative_input_tokens,
-            cumulative_cached_tokens,
-            session_cache_hit_ratio,
-            cumulative_output_tokens,
+    Ok((
+        ConversationAnalysis {
+            conversation_id: conv_id.to_string(),
+            found: true,
+            exact: !planner_indices.is_empty() && !just_compacted_pending_planner,
+            model: model_info,
+            context_limit,
+            used_tokens,
+            free_tokens,
+            used_percent,
+            step_count: steps.len(),
+            planner_turn_count: planner_indices.len(),
+            last_step_at,
+            cache: CacheStats {
+                last_prompt_tokens: last_prompt_total,
+                since_last_cache_tokens: last_input_uncached,
+                cached_tokens: last_cache_read,
+                cache_hit_ratio: round_1dp(cache_hit_ratio_frac * 100.0),
+                last_output_tokens,
+                cumulative_input_tokens,
+                cumulative_cached_tokens,
+                session_cache_hit_ratio,
+                cumulative_output_tokens,
+            },
+            compactions,
+            total_saved_tokens,
+            buckets,
+            turns_history,
+            heavy_tool_calls,
+            total_tool_calls,
+            step_summaries,
+            spawned_subagents,
+            db_busy: model_res.db_busy,
         },
-        compactions,
-        total_saved_tokens,
-        buckets,
-        turns_history,
-        heavy_tool_calls,
-        total_tool_calls,
-        step_summaries,
-        spawned_subagents,
-        db_busy: model_res.db_busy,
-    })
+        model_from_db,
+    ))
 }
 
 fn read_file_utf8_lossy(path: &Path) -> String {
