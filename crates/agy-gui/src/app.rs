@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agy_core::analyzer::ConversationAnalysis;
+use agy_core::analyzer::{ConversationAnalysis, StepSummary};
 use agy_core::monitor::{MonitorCommand, MonitorConfig, MonitorHandle, MonitorSnapshot};
 use agy_core::paths::GeminiPaths;
 use agy_core::sessions::SessionSummary;
@@ -32,6 +32,7 @@ pub struct AgyMonitorApp {
     monitor: MonitorHandle,
     main_tab: MainTab,
     detail_tab: DetailTab,
+    steps_newest_first: bool,
     theme_mode: ThemeMode,
     always_on_top: bool,
     compact_mode: bool,
@@ -59,6 +60,7 @@ impl AgyMonitorApp {
             monitor,
             main_tab: MainTab::Realtime,
             detail_tab: DetailTab::Steps,
+            steps_newest_first: true,
             theme_mode,
             always_on_top: false,
             compact_mode: false,
@@ -823,7 +825,7 @@ impl AgyMonitorApp {
         analysis: &ConversationAnalysis,
         palette: &Palette,
     ) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.selectable_value(
                 &mut self.detail_tab,
                 DetailTab::Steps,
@@ -834,38 +836,75 @@ impl AgyMonitorApp {
                 DetailTab::HeavyTools,
                 format!("重いツール Top 15 ({})", analysis.total_tool_calls),
             );
+            if self.detail_tab == DetailTab::Steps {
+                ui.separator();
+                ui.selectable_value(&mut self.steps_newest_first, true, "最新順");
+                ui.selectable_value(&mut self.steps_newest_first, false, "昇順");
+            }
         });
         ui.separator();
 
         match self.detail_tab {
             DetailTab::Steps => {
-                egui::Grid::new("steps_table")
-                    .striped(true)
-                    .num_columns(6)
-                    .spacing([12.0, 4.0])
+                egui::ScrollArea::horizontal()
+                    .id_salt("steps_table_hscroll")
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.strong("#");
-                        ui.strong("種別");
-                        ui.strong("時刻");
-                        ui.strong("入力");
-                        ui.strong("キャッシュ");
-                        ui.strong("出力 / 概要");
-                        ui.end_row();
+                        egui::Grid::new("steps_table")
+                            .striped(true)
+                            .num_columns(10)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.strong("Step#");
+                                ui.strong("種別");
+                                ui.strong("時刻");
+                                ui.strong("Prompt");
+                                ui.strong("Cached");
+                                ui.strong("Uncached");
+                                ui.strong("Hit%");
+                                ui.strong("Output");
+                                ui.strong("Compaction");
+                                ui.strong("概要");
+                                ui.end_row();
 
-                        for st in analysis.step_summaries.iter().rev().take(200) {
-                            ui.monospace(st.step_index.to_string());
-                            ui.label(&st.step_type);
-                            ui.monospace(format_step_time(st.created_at.as_deref()));
-                            ui.monospace(format_tokens(st.prompt_tokens));
-                            ui.monospace(format_tokens(st.cached_tokens));
-                            let tail = if st.output_tokens > 0 {
-                                format!("{} | {}", format_tokens(st.output_tokens), st.summary)
-                            } else {
-                                st.summary.clone()
-                            };
-                            ui.label(egui::RichText::new(tail).color(palette.text_muted));
-                            ui.end_row();
-                        }
+                                let rows: Box<dyn Iterator<Item = &StepSummary>> =
+                                    if self.steps_newest_first {
+                                        Box::new(analysis.step_summaries.iter().rev().take(200))
+                                    } else {
+                                        Box::new(analysis.step_summaries.iter().take(200))
+                                    };
+
+                                for st in rows {
+                                    ui.monospace(st.step_index.to_string());
+                                    ui.label(&st.step_type);
+                                    ui.monospace(format_step_time(st.created_at.as_deref()));
+                                    ui.monospace(format_tokens(st.prompt_tokens));
+                                    ui.monospace(format_tokens(st.cached_tokens));
+                                    ui.monospace(format_tokens(st.uncached_tokens));
+                                    let hit_text = if st.prompt_tokens > 0 {
+                                        format!("{:.1}%", st.cache_hit_percent())
+                                    } else {
+                                        "-".to_string()
+                                    };
+                                    ui.monospace(hit_text);
+                                    ui.monospace(format_tokens(st.output_tokens));
+                                    if st.compacted {
+                                        ui.label(
+                                            egui::RichText::new("圧縮")
+                                                .strong()
+                                                .color(palette.warn),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("-").color(palette.text_muted),
+                                        );
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(&st.summary).color(palette.text_muted),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
                     });
             }
             DetailTab::HeavyTools => {
@@ -875,29 +914,36 @@ impl AgyMonitorApp {
                             .color(palette.text_muted),
                     );
                 } else {
-                    egui::Grid::new("heavy_tools_table")
-                        .striped(true)
-                        .num_columns(5)
-                        .spacing([12.0, 4.0])
+                    egui::ScrollArea::horizontal()
+                        .id_salt("heavy_tools_hscroll")
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            ui.strong("#");
-                            ui.strong("ステップ");
-                            ui.strong("ツール");
-                            ui.strong("推定トークン");
-                            ui.strong("対象パス");
-                            ui.end_row();
+                            egui::Grid::new("heavy_tools_table")
+                                .striped(true)
+                                .num_columns(5)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.strong("#");
+                                    ui.strong("ステップ");
+                                    ui.strong("ツール");
+                                    ui.strong("推定トークン");
+                                    ui.strong("対象パス");
+                                    ui.end_row();
 
-                            for (idx, tc) in analysis.heavy_tool_calls.iter().enumerate() {
-                                ui.monospace((idx + 1).to_string());
-                                ui.monospace(tc.step_index.to_string());
-                                ui.label(&tc.label);
-                                ui.monospace(format_tokens(tc.tokens));
-                                ui.label(
-                                    egui::RichText::new(tc.target_path.as_deref().unwrap_or("-"))
-                                        .color(palette.text_muted),
-                                );
-                                ui.end_row();
-                            }
+                                    for (idx, tc) in analysis.heavy_tool_calls.iter().enumerate() {
+                                        ui.monospace((idx + 1).to_string());
+                                        ui.monospace(tc.step_index.to_string());
+                                        ui.label(&tc.label);
+                                        ui.monospace(format_tokens(tc.tokens));
+                                        ui.label(
+                                            egui::RichText::new(
+                                                tc.target_path.as_deref().unwrap_or("-"),
+                                            )
+                                            .color(palette.text_muted),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
                         });
                 }
             }
@@ -1268,18 +1314,64 @@ mod tests {
                 tokens: 50_000,
             }],
             total_tool_calls: 1,
-            step_summaries: vec![StepSummary {
-                step_index: 0,
-                step_type: "USER_INPUT".to_string(),
-                source: "USER".to_string(),
-                status: "DONE".to_string(),
-                created_at: Some("2026-11-22T15:00:00Z".to_string()),
-                prompt_tokens: 190_000,
-                cached_tokens: 180_000,
-                output_tokens: 2_000,
-                est_tokens: 100,
-                summary: "テスト実行".to_string(),
-            }],
+            step_summaries: vec![
+                StepSummary {
+                    step_index: 0,
+                    step_type: "USER_INPUT".to_string(),
+                    source: "USER".to_string(),
+                    status: "DONE".to_string(),
+                    created_at: Some("2026-11-22T15:00:00Z".to_string()),
+                    prompt_tokens: 0,
+                    uncached_tokens: 0,
+                    cached_tokens: 0,
+                    output_tokens: 0,
+                    est_tokens: 100,
+                    compacted: false,
+                    summary: "init-step-0".to_string(),
+                },
+                StepSummary {
+                    step_index: 1,
+                    step_type: "PLANNER_RESPONSE".to_string(),
+                    source: "MODEL".to_string(),
+                    status: "DONE".to_string(),
+                    created_at: Some("2026-11-22T15:01:00Z".to_string()),
+                    prompt_tokens: 120_000,
+                    uncached_tokens: 20_000,
+                    cached_tokens: 100_000,
+                    output_tokens: 1_000,
+                    est_tokens: 120_000,
+                    compacted: false,
+                    summary: "plan-step-1".to_string(),
+                },
+                StepSummary {
+                    step_index: 2,
+                    step_type: "CHECKPOINT".to_string(),
+                    source: "SYSTEM".to_string(),
+                    status: "DONE".to_string(),
+                    created_at: Some("2026-11-22T15:02:00Z".to_string()),
+                    prompt_tokens: 121_000,
+                    uncached_tokens: 121_000,
+                    cached_tokens: 0,
+                    output_tokens: 1_200,
+                    est_tokens: 1_200,
+                    compacted: true,
+                    summary: "checkpoint-step-2".to_string(),
+                },
+                StepSummary {
+                    step_index: 3,
+                    step_type: "PLANNER_RESPONSE".to_string(),
+                    source: "MODEL".to_string(),
+                    status: "DONE".to_string(),
+                    created_at: Some("2026-11-22T15:03:00Z".to_string()),
+                    prompt_tokens: 190_000,
+                    uncached_tokens: 10_000,
+                    cached_tokens: 180_000,
+                    output_tokens: 2_000,
+                    est_tokens: 190_000,
+                    compacted: false,
+                    summary: "done-step-3".to_string(),
+                },
+            ],
             spawned_subagents: vec![],
             db_busy: false,
         };
@@ -1307,6 +1399,7 @@ mod tests {
             monitor,
             main_tab: MainTab::Realtime,
             detail_tab: DetailTab::Steps,
+            steps_newest_first: true,
             theme_mode: ThemeMode::Dark,
             always_on_top: false,
             compact_mode: false,
@@ -1362,14 +1455,26 @@ mod tests {
         let ctx = egui::Context::default();
         install_japanese_fonts(&ctx);
 
-        // Render at minimum window size (760x520) across tabs & themes
-        for (tab, detail, theme) in [
-            (MainTab::Realtime, DetailTab::Steps, ThemeMode::Dark),
-            (MainTab::Realtime, DetailTab::HeavyTools, ThemeMode::Light),
-            (MainTab::UsagePhase2, DetailTab::Steps, ThemeMode::Dark),
+        // Render at minimum window size (760x520) across tabs, sort orders & themes
+        for (tab, detail, newest_first, theme) in [
+            (MainTab::Realtime, DetailTab::Steps, true, ThemeMode::Dark),
+            (MainTab::Realtime, DetailTab::Steps, false, ThemeMode::Light),
+            (
+                MainTab::Realtime,
+                DetailTab::HeavyTools,
+                true,
+                ThemeMode::Light,
+            ),
+            (
+                MainTab::UsagePhase2,
+                DetailTab::Steps,
+                true,
+                ThemeMode::Dark,
+            ),
         ] {
             app.main_tab = tab;
             app.detail_tab = detail;
+            app.steps_newest_first = newest_first;
             app.theme_mode = theme;
             apply_theme(&ctx, theme);
 
@@ -1384,8 +1489,209 @@ mod tests {
                 app.render_ui(ui, &snap);
             });
             let shapes_len = output.shapes.len();
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .all(|s| s.clip_rect.right() <= 760.5 && s.clip_rect.bottom() <= 520.5),
+                "narrow layout emitted shapes clipped beyond viewport"
+            );
             output.textures_delta.clear();
             assert!(shapes_len > 0);
         }
+    }
+
+    fn collect_rendered_texts(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<(String, egui::Pos2, egui::Rect)> {
+        fn walk_shape(
+            shape: &egui::epaint::Shape,
+            clip_rect: egui::Rect,
+            out: &mut Vec<(String, egui::Pos2, egui::Rect)>,
+        ) {
+            match shape {
+                egui::epaint::Shape::Text(ts) => {
+                    out.push((ts.galley.text().to_string(), ts.pos, clip_rect));
+                }
+                egui::epaint::Shape::Vec(children) => {
+                    for child in children {
+                        walk_shape(child, clip_rect, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk_shape(&clipped.shape, clipped.clip_rect, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn gui_04_steps_table_sort_toggle_and_columns() {
+        let (_tmp, mut app) = make_test_app();
+        let snap = sample_snapshot();
+        let ctx = egui::Context::default();
+        install_japanese_fonts(&ctx);
+        apply_theme(&ctx, ThemeMode::Dark);
+
+        let viewport = egui::vec2(1400.0, 1400.0);
+        let run_frame = |app: &mut AgyMonitorApp, events: Vec<egui::Event>| {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                events,
+                ..Default::default()
+            };
+            let mut asc_pos = None;
+            let mut desc_pos = None;
+            let output = ctx.run_ui(raw_input, |ui| {
+                app.render_ui(ui, &snap);
+            });
+            let texts = collect_rendered_texts(&output.shapes);
+            for (txt, pos, _clip) in &texts {
+                if txt == "昇順" {
+                    asc_pos = Some(*pos);
+                } else if txt == "最新順" {
+                    desc_pos = Some(*pos);
+                }
+            }
+            let mut output = output;
+            output.textures_delta.clear();
+            (texts, asc_pos, desc_pos)
+        };
+
+        // Frame 1 & 2 (allow layout to settle): default newest-first ("最新順")
+        let _ = run_frame(&mut app, vec![]);
+        let (texts_desc, asc_pos, _desc_pos) = run_frame(&mut app, vec![]);
+        assert!(app.steps_newest_first);
+
+        // Verify all 10 column headers and sort toggle labels rendered within clip_rect
+        for required in [
+            "最新順",
+            "昇順",
+            "Step#",
+            "種別",
+            "時刻",
+            "Prompt",
+            "Cached",
+            "Uncached",
+            "Hit%",
+            "Output",
+            "Compaction",
+            "概要",
+            "20.0k", // Uncached on step 1
+            "83.3%", // Hit% on step 1 (100k / 120k)
+            "圧縮",  // Compaction badge on step 2
+        ] {
+            let found = texts_desc
+                .iter()
+                .find(|(t, pos, clip)| t == required && clip.contains(*pos + egui::vec2(1.0, 1.0)));
+            assert!(
+                found.is_some(),
+                "expected '{required}' to be rendered unclipped in Steps table; texts={:?}",
+                texts_desc.iter().map(|(t, _, _)| t).collect::<Vec<_>>()
+            );
+        }
+
+        let y_step0_desc = texts_desc
+            .iter()
+            .find(|(t, _, _)| t == "init-step-0")
+            .expect("init-step-0 rendered")
+            .1
+            .y;
+        let y_step3_desc = texts_desc
+            .iter()
+            .find(|(t, _, _)| t == "done-step-3")
+            .expect("done-step-3 rendered")
+            .1
+            .y;
+        assert!(
+            y_step3_desc < y_step0_desc,
+            "newest-first must place step 3 ({y_step3_desc}) above step 0 ({y_step0_desc})"
+        );
+
+        // Click the "昇順" toggle button via pointer events
+        let click_pos = asc_pos.expect("昇順 button position") + egui::vec2(8.0, 6.0);
+        let _ = run_frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            !app.steps_newest_first,
+            "clicking '昇順' must switch steps_newest_first to false"
+        );
+
+        let (texts_asc, _, desc_pos) = run_frame(&mut app, vec![]);
+        let y_step0_asc = texts_asc
+            .iter()
+            .find(|(t, _, _)| t == "init-step-0")
+            .expect("init-step-0 rendered in asc")
+            .1
+            .y;
+        let y_step3_asc = texts_asc
+            .iter()
+            .find(|(t, _, _)| t == "done-step-3")
+            .expect("done-step-3 rendered in asc")
+            .1
+            .y;
+        assert!(
+            y_step0_asc < y_step3_asc,
+            "ascending sort must place step 0 ({y_step0_asc}) above step 3 ({y_step3_asc})"
+        );
+
+        // Click "最新順" back to true and verify order flips back
+        let click_desc = desc_pos.expect("最新順 button position") + egui::vec2(8.0, 6.0);
+        let _ = run_frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(click_desc),
+                egui::Event::PointerButton {
+                    pos: click_desc,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: click_desc,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            app.steps_newest_first,
+            "clicking '最新順' must switch steps_newest_first back to true"
+        );
+        let (texts_back, _, _) = run_frame(&mut app, vec![]);
+        let y_step0_back = texts_back
+            .iter()
+            .find(|(t, _, _)| t == "init-step-0")
+            .unwrap()
+            .1
+            .y;
+        let y_step3_back = texts_back
+            .iter()
+            .find(|(t, _, _)| t == "done-step-3")
+            .unwrap()
+            .1
+            .y;
+        assert!(y_step3_back < y_step0_back);
     }
 }

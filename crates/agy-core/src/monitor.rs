@@ -153,56 +153,38 @@ fn run_poller(
             Ok(cmd) => {
                 let mut force_reanalyze = false;
                 let mut should_poll = false;
-                match cmd {
-                    MonitorCommand::SelectConversation(id) => {
-                        if selected_id != id {
-                            selected_id = id;
-                            should_poll = true;
-                        }
-                    }
-                    MonitorCommand::SetFollowLatest(flag) => {
-                        follow_latest = flag;
-                        should_poll = true;
-                    }
-                    MonitorCommand::SetPaused(flag) => {
-                        paused = flag;
-                        update_paused_state(&snapshot, paused, follow_latest, &config.notify);
-                        if !paused {
-                            should_poll = true;
-                        }
-                    }
-                    MonitorCommand::RefreshNow => {
-                        should_poll = true;
-                        force_reanalyze = true;
-                    }
-                    MonitorCommand::Shutdown => break,
+                if matches!(
+                    apply_command(
+                        cmd,
+                        &mut follow_latest,
+                        &mut paused,
+                        &mut selected_id,
+                        &mut should_poll,
+                        &mut force_reanalyze,
+                        &snapshot,
+                        &config.notify,
+                    ),
+                    CommandOutcome::Exit
+                ) {
+                    break;
                 }
 
                 // Drain any queued commands before polling.
                 while let Ok(next_cmd) = rx.try_recv() {
-                    match next_cmd {
-                        MonitorCommand::SelectConversation(id) => {
-                            if selected_id != id {
-                                selected_id = id;
-                                should_poll = true;
-                            }
-                        }
-                        MonitorCommand::SetFollowLatest(flag) => {
-                            follow_latest = flag;
-                            should_poll = true;
-                        }
-                        MonitorCommand::SetPaused(flag) => {
-                            paused = flag;
-                            update_paused_state(&snapshot, paused, follow_latest, &config.notify);
-                            if !paused {
-                                should_poll = true;
-                            }
-                        }
-                        MonitorCommand::RefreshNow => {
-                            should_poll = true;
-                            force_reanalyze = true;
-                        }
-                        MonitorCommand::Shutdown => return,
+                    if matches!(
+                        apply_command(
+                            next_cmd,
+                            &mut follow_latest,
+                            &mut paused,
+                            &mut selected_id,
+                            &mut should_poll,
+                            &mut force_reanalyze,
+                            &snapshot,
+                            &config.notify,
+                        ),
+                        CommandOutcome::Exit
+                    ) {
+                        return;
                     }
                 }
 
@@ -237,6 +219,53 @@ fn run_poller(
             }
         }
     }
+}
+
+enum CommandOutcome {
+    Continue,
+    Exit,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_command(
+    cmd: MonitorCommand,
+    follow_latest: &mut bool,
+    paused: &mut bool,
+    selected_id: &mut Option<String>,
+    should_poll: &mut bool,
+    force_reanalyze: &mut bool,
+    snapshot: &Arc<Mutex<MonitorSnapshot>>,
+    notify: &Option<Arc<dyn Fn() + Send + Sync>>,
+) -> CommandOutcome {
+    match cmd {
+        MonitorCommand::SelectConversation(id) => {
+            if id.is_some() && *follow_latest {
+                *follow_latest = false;
+                *should_poll = true;
+            }
+            if *selected_id != id {
+                *selected_id = id;
+                *should_poll = true;
+            }
+        }
+        MonitorCommand::SetFollowLatest(flag) => {
+            *follow_latest = flag;
+            *should_poll = true;
+        }
+        MonitorCommand::SetPaused(flag) => {
+            *paused = flag;
+            update_paused_state(snapshot, *paused, *follow_latest, notify);
+            if !*paused {
+                *should_poll = true;
+            }
+        }
+        MonitorCommand::RefreshNow => {
+            *should_poll = true;
+            *force_reanalyze = true;
+        }
+        MonitorCommand::Shutdown => return CommandOutcome::Exit,
+    }
+    CommandOutcome::Continue
 }
 
 fn update_paused_state(

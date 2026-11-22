@@ -93,10 +93,22 @@ pub struct StepSummary {
     pub status: String,
     pub created_at: Option<String>,
     pub prompt_tokens: u64,
+    pub uncached_tokens: u64,
     pub cached_tokens: u64,
     pub output_tokens: u64,
     pub est_tokens: u64,
+    pub compacted: bool,
     pub summary: String,
+}
+
+impl StepSummary {
+    pub fn cache_hit_percent(&self) -> f64 {
+        if self.prompt_tokens == 0 {
+            0.0
+        } else {
+            (self.cached_tokens as f64 / self.prompt_tokens as f64) * 100.0
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,6 +393,7 @@ pub fn analyze_conversation(
     let mut planner_indices: Vec<usize> = Vec::new();
     let mut compactions: Vec<CompactionEvent> = Vec::new();
     let mut turns_history: Vec<TurnPoint> = Vec::new();
+    let mut compacted_step_positions: HashSet<usize> = HashSet::new();
     let mut last_compaction_step_idx: Option<usize> = None;
     let mut last_checkpoint_summary_tokens: u64 = 0;
     let mut saw_explicit_checkpoint_since_last_planner = false;
@@ -389,6 +402,7 @@ pub fn analyze_conversation(
     for (i, s) in steps.iter().enumerate() {
         let stype = s.step_type.as_deref().unwrap_or("");
         if stype == "CHECKPOINT" {
+            compacted_step_positions.insert(i);
             let cp_prompt = s.input_tokens.unwrap_or(0) + s.cache_read_tokens.unwrap_or(0);
             let prev_planner_total = last_planner_idx_so_far
                 .map(|pi| {
@@ -457,6 +471,7 @@ pub fn analyze_conversation(
                         let threshold = 5000.0_f64.max(prev_prompt as f64 * 0.12);
                         if (drop as f64) > threshold {
                             implicit_drop = true;
+                            compacted_step_positions.insert(i);
                             last_compaction_step_idx = Some(i.saturating_sub(1));
                             last_checkpoint_summary_tokens = 0;
                             compactions.push(CompactionEvent {
@@ -848,7 +863,7 @@ pub fn analyze_conversation(
     heavy_tool_calls.truncate(15);
 
     let total_saved_tokens = compactions.iter().map(|c| c.saved_tokens).sum();
-    let step_summaries = build_step_summaries(&steps);
+    let step_summaries = build_step_summaries(&steps, &compacted_step_positions);
     let last_step_at = steps.last().and_then(|s| s.created_at.clone());
 
     Ok(ConversationAnalysis {
@@ -953,7 +968,10 @@ fn attribute_raw_step(
     }
 }
 
-fn build_step_summaries(steps: &[TranscriptStep]) -> Vec<StepSummary> {
+fn build_step_summaries(
+    steps: &[TranscriptStep],
+    compacted_positions: &HashSet<usize>,
+) -> Vec<StepSummary> {
     steps
         .iter()
         .enumerate()
@@ -961,10 +979,12 @@ fn build_step_summaries(steps: &[TranscriptStep]) -> Vec<StepSummary> {
             let step_type = s.step_type.clone().unwrap_or_else(|| "UNKNOWN".to_string());
             let source = s.source.clone().unwrap_or_default();
             let status = s.status.clone().unwrap_or_default();
-            let prompt_tokens = s.input_tokens.unwrap_or(0) + s.cache_read_tokens.unwrap_or(0);
+            let uncached_tokens = s.input_tokens.unwrap_or(0);
             let cached_tokens = s.cache_read_tokens.unwrap_or(0);
+            let prompt_tokens = uncached_tokens + cached_tokens;
             let output_tokens = s.output_tokens.unwrap_or(0);
             let est_tokens = est_step_tokens(s);
+            let compacted = compacted_positions.contains(&idx);
 
             let summary = if let Some(tcs) = s.tool_calls.as_ref()
                 && !tcs.is_empty()
@@ -986,9 +1006,11 @@ fn build_step_summaries(steps: &[TranscriptStep]) -> Vec<StepSummary> {
                 status,
                 created_at: s.created_at.clone(),
                 prompt_tokens,
+                uncached_tokens,
                 cached_tokens,
                 output_tokens,
                 est_tokens,
+                compacted,
                 summary,
             }
         })

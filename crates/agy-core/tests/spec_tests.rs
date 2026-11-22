@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use agy_core::CoreError;
 use agy_core::analyzer::{
@@ -581,6 +581,19 @@ fn ctx_02_explicit_and_implicit_compaction_detection() {
     assert_eq!(res.compactions[1].after_tokens, Some(15_000));
     assert_eq!(res.compactions[1].saved_tokens, 35_000);
     assert_eq!(res.total_saved_tokens, 63_500);
+
+    // StepSummary uncached_tokens and compacted flags
+    assert_eq!(res.step_summaries.len(), 7);
+    assert_eq!(res.step_summaries[1].uncached_tokens, 10_000);
+    assert_eq!(res.step_summaries[1].cached_tokens, 30_000);
+    assert_eq!(res.step_summaries[1].prompt_tokens, 40_000);
+    assert!((res.step_summaries[1].cache_hit_percent() - 75.0).abs() < 0.01);
+    assert!(!res.step_summaries[1].compacted);
+    assert!(res.step_summaries[2].compacted); // explicit CHECKPOINT
+    assert!(!res.step_summaries[3].compacted); // post-checkpoint planner turn
+    assert!(res.step_summaries[5].compacted); // implicit compaction turn
+    assert_eq!(res.step_summaries[5].uncached_tokens, 3_000);
+    assert!(!res.step_summaries[6].compacted); // sub-threshold drop
 }
 
 #[test]
@@ -654,16 +667,39 @@ fn mon_01_poller_fingerprint_skip_commands_and_drop_join() {
     let tmp = TempDir::new().unwrap();
     let gemini = tmp.path().join(".gemini");
     let app = gemini.join("antigravity");
-    let conv_id = "dddddddd-1111-2222-3333-444444444444";
-    let logs = app
+    let older_id = "dddddddd-1111-2222-3333-444444444444";
+    let newer_id = "dddddddd-1111-2222-3333-555555555555";
+
+    let older_logs = app
         .join("brain")
-        .join(conv_id)
+        .join(older_id)
         .join(".system_generated")
         .join("logs");
-    std::fs::create_dir_all(&logs).unwrap();
-    let transcript = logs.join("transcript_full.jsonl");
+    std::fs::create_dir_all(&older_logs).unwrap();
+    let older_transcript = older_logs.join("transcript_full.jsonl");
     std::fs::write(
-        &transcript,
+        &older_transcript,
+        "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"older\"}\n",
+    )
+    .unwrap();
+    // Make older_id strictly older than newer_id regardless of filesystem timestamp granularity.
+    let past_time = SystemTime::now() - Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(&older_transcript)
+        .unwrap()
+        .set_modified(past_time)
+        .unwrap();
+
+    let newer_logs = app
+        .join("brain")
+        .join(newer_id)
+        .join(".system_generated")
+        .join("logs");
+    std::fs::create_dir_all(&newer_logs).unwrap();
+    let newer_transcript = newer_logs.join("transcript_full.jsonl");
+    std::fs::write(
+        &newer_transcript,
         "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"hello\"}\n",
     )
     .unwrap();
@@ -678,14 +714,15 @@ fn mon_01_poller_fingerprint_skip_commands_and_drop_join() {
 
     let handle = MonitorHandle::start(cfg);
 
-    // Wait for initial poll
+    // Wait for initial poll -> follow_latest=true selects newer_id
     let deadline = Instant::now() + Duration::from_secs(2);
     while handle.snapshot().last_updated_at.is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
 
     let snap1 = handle.snapshot();
-    assert_eq!(snap1.selected_id.as_deref(), Some(conv_id));
+    assert!(snap1.follow_latest);
+    assert_eq!(snap1.selected_id.as_deref(), Some(newer_id));
     assert_eq!(snap1.analysis_count, 1);
 
     // Let several poll intervals pass without changing files -> analysis_count must remain 1
@@ -693,9 +730,9 @@ fn mon_01_poller_fingerprint_skip_commands_and_drop_join() {
     let snap2 = handle.snapshot();
     assert_eq!(snap2.analysis_count, 1);
 
-    // Append a line -> fingerprint changes -> analysis_count increments to 2
+    // Append a line to newer_id -> fingerprint changes -> analysis_count increments to 2
     std::fs::write(
-        &transcript,
+        &newer_transcript,
         "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"hello\"}\n{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"input_tokens\":500,\"cache_read_tokens\":1500,\"output_tokens\":100}\n",
     )
     .unwrap();
@@ -704,6 +741,75 @@ fn mon_01_poller_fingerprint_skip_commands_and_drop_join() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(handle.snapshot().analysis_count, 2);
+
+    // Manually selecting the already-selected ID while follow_latest=true must turn follow_latest=false
+    handle.send(MonitorCommand::SelectConversation(Some(
+        newer_id.to_string(),
+    )));
+    let deadline_same = Instant::now() + Duration::from_secs(2);
+    while handle.snapshot().follow_latest && Instant::now() < deadline_same {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let snap_same = handle.snapshot();
+    assert!(!snap_same.follow_latest);
+    assert_eq!(snap_same.selected_id.as_deref(), Some(newer_id));
+
+    // Re-enable follow_latest before testing SelectConversation(Some(older_id)) alone
+    handle.send(MonitorCommand::SetFollowLatest(true));
+    let deadline_re_follow = Instant::now() + Duration::from_secs(2);
+    while !handle.snapshot().follow_latest && Instant::now() < deadline_re_follow {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.snapshot().follow_latest);
+
+    // Send SelectConversation(Some(older_id)) ALONE -> follow_latest=false & selected_id=older_id
+    handle.send(MonitorCommand::SelectConversation(Some(
+        older_id.to_string(),
+    )));
+    let deadline3 = Instant::now() + Duration::from_secs(2);
+    while (handle.snapshot().follow_latest
+        || handle.snapshot().selected_id.as_deref() != Some(older_id))
+        && Instant::now() < deadline3
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let snap_older = handle.snapshot();
+    assert!(!snap_older.follow_latest);
+    assert_eq!(snap_older.selected_id.as_deref(), Some(older_id));
+
+    // Update newer_id while follow_latest=false -> manual selection must NOT be overwritten
+    let before_update = snap_older.last_updated_at;
+    std::fs::write(
+        &newer_transcript,
+        "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"hello\"}\n{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"input_tokens\":500,\"cache_read_tokens\":1500,\"output_tokens\":100}\n{\"step_index\":2,\"type\":\"USER_INPUT\",\"content\":\"newer update\"}\n",
+    )
+    .unwrap();
+    let deadline_pin = Instant::now() + Duration::from_secs(2);
+    while handle.snapshot().last_updated_at <= before_update && Instant::now() < deadline_pin {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let after_first_poll = handle.snapshot().last_updated_at;
+    assert!(after_first_poll > before_update);
+    // Wait one more poll cycle as well
+    while handle.snapshot().last_updated_at <= after_first_poll && Instant::now() < deadline_pin {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let snap_pinned = handle.snapshot();
+    assert!(!snap_pinned.follow_latest);
+    assert_eq!(snap_pinned.selected_id.as_deref(), Some(older_id));
+
+    // SetFollowLatest(true) switches back to tracking newer_id
+    handle.send(MonitorCommand::SetFollowLatest(true));
+    let deadline4 = Instant::now() + Duration::from_secs(2);
+    while (!handle.snapshot().follow_latest
+        || handle.snapshot().selected_id.as_deref() != Some(newer_id))
+        && Instant::now() < deadline4
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let snap_resumed = handle.snapshot();
+    assert!(snap_resumed.follow_latest);
+    assert_eq!(snap_resumed.selected_id.as_deref(), Some(newer_id));
 
     // Pause, RefreshNow, Drop cleanly joins
     handle.send(MonitorCommand::SetPaused(true));
