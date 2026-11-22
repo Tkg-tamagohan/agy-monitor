@@ -1444,47 +1444,70 @@ fn mon_05_backfill_avoids_index_reloads_and_stops_on_busy_session() {
     let conv_dir = app.join("conversations");
     std::fs::create_dir_all(&conv_dir).unwrap();
 
-    let write_session = |id: &str, model_id: u64| -> std::path::PathBuf {
+    let base_mtime = SystemTime::now() - Duration::from_secs(600);
+    let write_session = |id: &str, model_id: u64, mtime: SystemTime| -> std::path::PathBuf {
         let logs = app
             .join("brain")
             .join(id)
             .join(".system_generated")
             .join("logs");
         std::fs::create_dir_all(&logs).unwrap();
+        let transcript_path = logs.join("transcript_full.jsonl");
         std::fs::write(
-            logs.join("transcript_full.jsonl"),
+            &transcript_path,
             format!("{{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"{id}\"}}\n"),
         )
         .unwrap();
 
         let db_path = conv_dir.join(format!("{id}.db"));
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);")
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);")
+                .unwrap();
+            let mut step_model = Vec::new();
+            encode_varint_field(1, model_id, &mut step_model);
+            let mut step_meta = Vec::new();
+            encode_bytes_field(24, &step_model, &mut step_meta);
+            conn.execute(
+                "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+                [&step_meta],
+            )
             .unwrap();
-        let mut step_model = Vec::new();
-        encode_varint_field(1, model_id, &mut step_model);
-        let mut step_meta = Vec::new();
-        encode_bytes_field(24, &step_model, &mut step_meta);
-        conn.execute(
-            "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
-            [&step_meta],
-        )
-        .unwrap();
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript_path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&db_path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
         db_path
     };
 
-    // 1 exclusively locked session created first, plus 45 unlocked sessions (> MAX_MODEL_SCANS_PER_TICK = 40).
-    let locked_id = "00000000-0000-0000-0000-000000000000";
-    let locked_db_path = write_session(locked_id, 1525);
-    let lock_conn = Connection::open(&locked_db_path).unwrap();
-    lock_conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
-
-    let mut unlocked_ids = Vec::with_capacity(45);
-    for i in 1..=45usize {
+    // 79 background unlocked sessions + 1 locked session (roots[1]) + 1 selected unlocked session (roots[0])
+    // = 81 sessions total. Tick 1 scans locked (1) + 39 unlocked; Tick 2 skips locked via busy_this_poll
+    // and scans the remaining 40 unlocked sessions (exact budget saturation).
+    let mut unlocked_ids = Vec::with_capacity(80);
+    for i in 1..=79usize {
         let id = format!("11111111-0000-0000-0000-{i:012}");
-        write_session(&id, 1026); // Claude Opus 4.6
+        write_session(&id, 1026, base_mtime + Duration::from_secs(i as u64)); // Claude Opus 4.6
         unlocked_ids.push(id);
     }
+
+    let locked_id = "00000000-0000-0000-0000-000000000001";
+    let locked_db_path = write_session(locked_id, 1525, base_mtime + Duration::from_secs(200));
+
+    let selected_id = "00000000-0000-0000-0000-000000000000";
+    write_session(selected_id, 1026, base_mtime + Duration::from_secs(300));
+    unlocked_ids.push(selected_id.to_string());
+
+    let lock_conn = Connection::open(&locked_db_path).unwrap();
+    lock_conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
 
     let notify_count = Arc::new(AtomicUsize::new(0));
     let notify_clone = Arc::clone(&notify_count);
@@ -1510,7 +1533,23 @@ fn mon_05_backfill_avoids_index_reloads_and_stops_on_busy_session() {
         std::thread::sleep(Duration::from_millis(15));
     }
 
+    let notify_deadline = Instant::now() + Duration::from_secs(1);
+    while notify_count.load(Ordering::SeqCst) < 2 && Instant::now() < notify_deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(20));
+
     let snap_done = handle.snapshot();
+    assert_eq!(snap_done.selected_id.as_deref(), Some(selected_id));
+    assert_eq!(
+        snap_done.index.roots[0].summary.conversation_id.as_str(),
+        selected_id
+    );
+    assert_eq!(
+        snap_done.index.roots[1].summary.conversation_id.as_str(),
+        locked_id,
+        "locked session must be roots[1] so Tick 1 guarantees scanning it"
+    );
     for id in &unlocked_ids {
         assert_eq!(
             snap_done
@@ -1536,23 +1575,25 @@ fn mon_05_backfill_avoids_index_reloads_and_stops_on_busy_session() {
         1,
         "backfill ticks must not reload the session index"
     );
-
-    // Wait for the final backfill tick's notify callback to finish before sampling.
-    let notify_deadline = Instant::now() + Duration::from_secs(1);
-    while notify_count.load(Ordering::SeqCst) < 2 && Instant::now() < notify_deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        handle.model_scan_count(),
+        80,
+        "locked session must be scanned once on Tick 1 and skipped on Tick 2 (1 locked + 79 background unlocked = 80)"
+    );
+    assert_eq!(
+        notify_count.load(Ordering::SeqCst),
+        2,
+        "exact 2 ticks (1 initial poll + 1 backfill tick) should complete all 80 unlocked sessions"
+    );
 
     // Confirm backfill stopped spinning at 50ms once only the locked session remained.
-    let notifications_at_done = notify_count.load(Ordering::SeqCst);
-    assert!(notifications_at_done >= 2);
     std::thread::sleep(Duration::from_millis(350));
     assert_eq!(
         notify_count.load(Ordering::SeqCst),
-        notifications_at_done,
+        2,
         "backfill must stop spinning at 50ms once non-locked sessions complete"
     );
+    assert_eq!(handle.model_scan_count(), 80);
     assert_eq!(handle.index_reload_count(), 1);
 
     drop(handle);

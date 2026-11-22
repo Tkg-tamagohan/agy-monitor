@@ -84,6 +84,7 @@ pub struct MonitorHandle {
     tx: Sender<MonitorCommand>,
     snapshot: Arc<Mutex<MonitorSnapshot>>,
     index_reload_count: Arc<AtomicU64>,
+    model_scan_count: Arc<AtomicU64>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -97,12 +98,14 @@ impl MonitorHandle {
         let snap_clone = Arc::clone(&snapshot);
         let index_reload_count = Arc::new(AtomicU64::new(0));
         let reload_count_clone = Arc::clone(&index_reload_count);
+        let model_scan_count = Arc::new(AtomicU64::new(0));
+        let scan_count_clone = Arc::clone(&model_scan_count);
         let (tx, rx) = mpsc::channel::<MonitorCommand>();
 
         let thread = thread::Builder::new()
             .name("agy-monitor-poller".to_string())
             .spawn(move || {
-                run_poller(config, rx, snap_clone, reload_count_clone);
+                run_poller(config, rx, snap_clone, reload_count_clone, scan_count_clone);
             })
             .expect("failed to spawn monitor polling thread");
 
@@ -110,6 +113,7 @@ impl MonitorHandle {
             tx,
             snapshot,
             index_reload_count,
+            model_scan_count,
             thread: Some(thread),
         }
     }
@@ -124,6 +128,10 @@ impl MonitorHandle {
 
     pub fn index_reload_count(&self) -> u64 {
         self.index_reload_count.load(Ordering::SeqCst)
+    }
+
+    pub fn model_scan_count(&self) -> u64 {
+        self.model_scan_count.load(Ordering::SeqCst)
     }
 }
 
@@ -141,6 +149,7 @@ fn run_poller(
     rx: mpsc::Receiver<MonitorCommand>,
     snapshot: Arc<Mutex<MonitorSnapshot>>,
     index_reload_count: Arc<AtomicU64>,
+    model_scan_count: Arc<AtomicU64>,
 ) {
     let mut follow_latest = config.follow_latest;
     let mut paused = false;
@@ -168,6 +177,7 @@ fn run_poller(
         paused,
         false,
         &index_reload_count,
+        &model_scan_count,
         &snapshot,
     );
     let mut last_full_poll_at = Instant::now();
@@ -241,6 +251,7 @@ fn run_poller(
                         paused,
                         force_reanalyze,
                         &index_reload_count,
+                        &model_scan_count,
                         &snapshot,
                     );
                     last_full_poll_at = Instant::now();
@@ -265,6 +276,7 @@ fn run_poller(
                             paused,
                             false,
                             &index_reload_count,
+                            &model_scan_count,
                             &snapshot,
                         );
                         last_full_poll_at = Instant::now();
@@ -278,6 +290,7 @@ fn run_poller(
                             &mut model_label_cache,
                             &mut cached_index,
                             &mut busy_this_poll,
+                            &model_scan_count,
                             &snapshot,
                         );
                     }
@@ -364,6 +377,7 @@ fn perform_poll(
     paused: bool,
     force_reanalyze: bool,
     index_reload_count: &Arc<AtomicU64>,
+    model_scan_count: &Arc<AtomicU64>,
     snapshot: &Arc<Mutex<MonitorSnapshot>>,
 ) -> bool {
     index_reload_count.fetch_add(1, Ordering::SeqCst);
@@ -452,6 +466,7 @@ fn perform_poll(
         true,
         model_label_cache,
         busy_this_poll,
+        model_scan_count,
     );
 
     let db_busy = index.db_busy || analysis_db_busy;
@@ -487,6 +502,7 @@ fn perform_model_backfill_tick(
     model_label_cache: &mut HashMap<String, (DbFingerprint, String)>,
     cached_index: &mut Option<SessionIndex>,
     busy_this_poll: &mut HashSet<String>,
+    model_scan_count: &Arc<AtomicU64>,
     snapshot: &Arc<Mutex<MonitorSnapshot>>,
 ) -> bool {
     let Some(index) = cached_index.as_mut() else {
@@ -518,6 +534,7 @@ fn perform_model_backfill_tick(
         can_seed_selected,
         model_label_cache,
         busy_this_poll,
+        model_scan_count,
     );
 
     let db_busy = index.db_busy || selected_db_busy;
@@ -547,6 +564,7 @@ fn populate_session_model_labels(
     can_seed_selected: bool,
     cache: &mut HashMap<String, (DbFingerprint, String)>,
     busy_this_poll: &mut HashSet<String>,
+    model_scan_count: &Arc<AtomicU64>,
 ) -> bool {
     // Evict removed sessions to keep cache bounded.
     cache.retain(|id, _| index.by_id.contains_key(id));
@@ -663,6 +681,7 @@ fn populate_session_model_labels(
         }
 
         scans += 1;
+        model_scan_count.fetch_add(1, Ordering::SeqCst);
         let (label_opt, busy) = detect_conversation_model_label_from_db(&summary.app_data_dir, &id);
         let label = label_opt.unwrap_or_default();
         if !busy {
@@ -680,8 +699,11 @@ fn populate_session_model_labels(
     }
 
     // Keep the selected session synchronized with the full conversation analysis label
-    // only when the label was derived from the session DB (never pbtxt fallback).
-    if cached_model_from_db
+    // only when the cached analysis still matches the current DB fingerprint, was not busy,
+    // and was derived from the session DB (never pbtxt fallback).
+    if can_seed_selected
+        && !selected_db_busy
+        && cached_model_from_db
         && let (Some(sel), Some(analysis)) = (selected_id, cached_analysis)
         && analysis.conversation_id == sel
         && !analysis.model.model_label.is_empty()
@@ -707,4 +729,163 @@ fn populate_session_model_labels(
     }
 
     has_more
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    fn encode_varint(mut v: u64, buf: &mut Vec<u8>) {
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            buf.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    fn encode_varint_field(field: u64, v: u64, buf: &mut Vec<u8>) {
+        encode_varint(field << 3, buf);
+        encode_varint(v, buf);
+    }
+
+    fn encode_bytes_field(field: u64, data: &[u8], buf: &mut Vec<u8>) {
+        encode_varint((field << 3) | 2, buf);
+        encode_varint(data.len() as u64, buf);
+        buf.extend_from_slice(data);
+    }
+
+    fn step_metadata_with_model_id(model_id: u64) -> Vec<u8> {
+        let mut step_model = Vec::new();
+        encode_varint_field(1, model_id, &mut step_model);
+        let mut step_meta = Vec::new();
+        encode_bytes_field(24, &step_model, &mut step_meta);
+        step_meta
+    }
+
+    #[test]
+    fn mon_06_backfill_keeps_fresh_selected_model_when_db_changes() {
+        let tmp = TempDir::new().unwrap();
+        let gemini = tmp.path().join(".gemini");
+        let app = gemini.join("antigravity");
+        let conv_dir = app.join("conversations");
+        let sel_id = "aaaaaaaa-0000-0000-0000-000000000001";
+        let logs = app
+            .join("brain")
+            .join(sel_id)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("transcript_full.jsonl"),
+            "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+
+        let db_path = conv_dir.join(format!("{sel_id}.db"));
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);")
+                .unwrap();
+            let meta = step_metadata_with_model_id(1026); // Claude Opus 4.6
+            conn.execute("INSERT INTO steps (idx, metadata) VALUES (1, ?1)", [&meta])
+                .unwrap();
+        }
+
+        let config = MonitorConfig::new(GeminiPaths::from_gemini_dir(&gemini));
+        let snapshot = Arc::new(Mutex::new(MonitorSnapshot::default()));
+        let index_reload_count = Arc::new(AtomicU64::new(0));
+        let model_scan_count = Arc::new(AtomicU64::new(0));
+        let mut follow_latest = true;
+        let mut selected_id: Option<String> = None;
+        let mut cached_key: Option<AnalysisCacheKey> = None;
+        let mut cached_analysis: Option<ConversationAnalysis> = None;
+        let mut cached_model_from_db = false;
+        let mut analysis_count = 0u64;
+        let mut model_label_cache = HashMap::new();
+        let mut cached_index = None;
+        let mut busy_this_poll = HashSet::new();
+
+        let _ = perform_poll(
+            &config,
+            &mut follow_latest,
+            &mut selected_id,
+            &mut cached_key,
+            &mut cached_analysis,
+            &mut cached_model_from_db,
+            &mut analysis_count,
+            &mut model_label_cache,
+            &mut cached_index,
+            &mut busy_this_poll,
+            false,
+            false,
+            &index_reload_count,
+            &model_scan_count,
+            &snapshot,
+        );
+
+        assert_eq!(selected_id.as_deref(), Some(sel_id));
+        assert!(cached_key.is_some());
+        assert!(cached_model_from_db);
+        assert_eq!(
+            snapshot
+                .lock()
+                .unwrap()
+                .index
+                .by_id
+                .get(sel_id)
+                .map(|s| s.model_label.as_str()),
+            Some("Claude Opus 4.6")
+        );
+
+        // Update the selected session's DB with a different model and advance mtime so DbFingerprint changes.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let meta = step_metadata_with_model_id(1525); // Gemini 4 Hydrogen (High)
+            conn.execute("UPDATE steps SET metadata = ?1 WHERE idx = 1", [&meta])
+                .unwrap();
+            conn.execute("INSERT INTO steps (idx, metadata) VALUES (2, ?1)", [&meta])
+                .unwrap();
+        }
+        let bumped = std::time::SystemTime::now() + Duration::from_secs(2);
+        std::fs::File::options()
+            .write(true)
+            .open(&db_path)
+            .unwrap()
+            .set_modified(bumped)
+            .unwrap();
+
+        let scans_before = model_scan_count.load(Ordering::SeqCst);
+        let _ = perform_model_backfill_tick(
+            &config,
+            selected_id.as_deref(),
+            cached_key.as_ref(),
+            cached_analysis.as_ref(),
+            cached_model_from_db,
+            &mut model_label_cache,
+            &mut cached_index,
+            &mut busy_this_poll,
+            &model_scan_count,
+            &snapshot,
+        );
+
+        assert_eq!(model_scan_count.load(Ordering::SeqCst) - scans_before, 1);
+        let snap = snapshot.lock().unwrap();
+        assert_eq!(
+            snap.index.by_id.get(sel_id).map(|s| s.model_label.as_str()),
+            Some("Gemini 4 Hydrogen (High)")
+        );
+        assert_eq!(
+            snap.index.roots[0].summary.model_label.as_str(),
+            "Gemini 4 Hydrogen (High)"
+        );
+    }
 }
