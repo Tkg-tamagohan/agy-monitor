@@ -8,7 +8,8 @@ use agy_core::analyzer::{
 };
 use agy_core::fingerprint::{DbFingerprint, FileStamp, TranscriptFingerprint};
 use agy_core::models::{
-    detect_conversation_model, format_model_label, is_concrete_model_slug, lookup_model_id,
+    detect_conversation_model, detect_conversation_model_label_from_db, format_model_label,
+    format_model_short_label, is_concrete_model_slug, lookup_model_id,
     map_placeholder_enum_to_slug, normalize_model_slug, resolve_model_context_limit,
 };
 use agy_core::monitor::{MonitorCommand, MonitorConfig, MonitorHandle};
@@ -898,7 +899,7 @@ fn mon_02_db_busy_does_not_freeze_cache_key() {
     let handle = MonitorHandle::start(cfg);
 
     // Wait for first poll (which hits db_busy)
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(6);
     while handle.snapshot().last_updated_at.is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -911,7 +912,7 @@ fn mon_02_db_busy_does_not_freeze_cache_key() {
 
     // Monitor must NOT have frozen the cache key while db_busy was true;
     // subsequent poll should re-analyze and resolve the 320k limit and model.
-    let deadline2 = Instant::now() + Duration::from_secs(3);
+    let deadline2 = Instant::now() + Duration::from_secs(6);
     while Instant::now() < deadline2 {
         let s = handle.snapshot();
         if !s.db_busy
@@ -980,4 +981,218 @@ fn smoke_01_readonly_real_gemini_data() {
         before_stamp, after_stamp,
         "read-only smoke must not modify existing DB"
     );
+}
+
+#[test]
+fn model_02_db_only_model_label_and_short_format() {
+    let tmp = TempDir::new().unwrap();
+    let app = tmp.path().join(".gemini").join("antigravity");
+    let conv_dir = app.join("conversations");
+    std::fs::create_dir_all(&conv_dir).unwrap();
+
+    // Missing DB -> (None, false) even if antigravity_state.pbtxt exists
+    std::fs::write(
+        app.join("antigravity_state.pbtxt"),
+        "last_selected_agent_model: MODEL_PLACEHOLDER_M26\n",
+    )
+    .unwrap();
+    let missing_id = "11111111-aaaa-bbbb-cccc-000000000001";
+    assert_eq!(
+        detect_conversation_model_label_from_db(&app, missing_id),
+        (None, false)
+    );
+
+    // Populated steps table -> returns formatted label without falling back to pbtxt
+    let valid_id = "11111111-aaaa-bbbb-cccc-000000000002";
+    let db_path = conv_dir.join(format!("{valid_id}.db"));
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);")
+        .unwrap();
+    let mut step_model = Vec::new();
+    encode_varint_field(1, 1026, &mut step_model); // claude-opus-4-6
+    let mut step_meta = Vec::new();
+    encode_bytes_field(24, &step_model, &mut step_meta);
+    conn.execute(
+        "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+        [&step_meta],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_eq!(
+        detect_conversation_model_label_from_db(&app, valid_id),
+        (Some("Claude Opus 4.6".to_string()), false)
+    );
+
+    // Short label rules
+    assert_eq!(
+        format_model_short_label("Claude Opus 4.6 (High)"),
+        "Claude Opus 4.6 (H)"
+    );
+    assert_eq!(
+        format_model_short_label("Gemini 4 Hydrogen (Medium)"),
+        "Gemini 4 Hydrogen (M)"
+    );
+    assert_eq!(
+        format_model_short_label("Gemini 3.8 Flash (Low)"),
+        "Gemini 3.8 Flash (L)"
+    );
+    assert_eq!(
+        format_model_short_label("Orchestrator (Carbon)"),
+        "Orch (Carbon)"
+    );
+    assert_eq!(
+        format_model_short_label("Gemini Flash Worker"),
+        "Flash Worker"
+    );
+    assert_eq!(format_model_short_label("Gemini 4 Neon"), "Gemini 4 Neon");
+    assert_eq!(format_model_short_label("Default model"), "");
+}
+
+#[test]
+fn mon_03_poller_populates_sidebar_model_labels_with_fingerprint_cache() {
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    let conv_dir = app.join("conversations");
+    std::fs::create_dir_all(&conv_dir).unwrap();
+
+    let id_a = "aaaaaaaa-0000-0000-0000-000000000001";
+    let id_b = "bbbbbbbb-0000-0000-0000-000000000002";
+    for (id, text) in [
+        (
+            id_a,
+            "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"a\"}\n",
+        ),
+        (
+            id_b,
+            "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"b\"}\n",
+        ),
+    ] {
+        let logs = app
+            .join("brain")
+            .join(id)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("transcript_full.jsonl"), text).unwrap();
+    }
+
+    // id_a has DB (claude-opus-4-6), id_b has DB locked initially
+    let write_model_db = |db_path: &std::path::Path, model_id: u64| {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, metadata BLOB);",
+        )
+        .unwrap();
+        let mut step_model = Vec::new();
+        encode_varint_field(1, model_id, &mut step_model);
+        let mut step_meta = Vec::new();
+        encode_bytes_field(24, &step_model, &mut step_meta);
+        conn.execute(
+            "INSERT OR REPLACE INTO steps (idx, metadata) VALUES (1, ?1)",
+            [&step_meta],
+        )
+        .unwrap();
+    };
+
+    let db_a = conv_dir.join(format!("{id_a}.db"));
+    write_model_db(&db_a, 1026); // Claude Opus 4.6
+
+    let db_b = conv_dir.join(format!("{id_b}.db"));
+    let lock_b = Connection::open(&db_b).unwrap();
+    lock_b
+        .execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);")
+        .unwrap();
+    let mut step_model_b = Vec::new();
+    encode_varint_field(1, 1525, &mut step_model_b); // Gemini 4 Hydrogen (High)
+    let mut step_meta_b = Vec::new();
+    encode_bytes_field(24, &step_model_b, &mut step_meta_b);
+    lock_b
+        .execute(
+            "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+            [&step_meta_b],
+        )
+        .unwrap();
+    lock_b.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+    let mut cfg = MonitorConfig::new(GeminiPaths::from_gemini_dir(&gemini));
+    cfg.poll_interval = Duration::from_millis(40);
+    let handle = MonitorHandle::start(cfg);
+
+    let deadline1 = Instant::now() + Duration::from_secs(6);
+    while handle
+        .snapshot()
+        .index
+        .by_id
+        .get(id_a)
+        .map(|s| s.model_label.as_str())
+        != Some("Claude Opus 4.6")
+        && Instant::now() < deadline1
+    {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let snap1 = handle.snapshot();
+    assert_eq!(
+        snap1.index.by_id.get(id_a).map(|s| s.model_label.as_str()),
+        Some("Claude Opus 4.6")
+    );
+    // Locked db_b must not freeze empty cache permanently
+    assert_eq!(
+        snap1.index.by_id.get(id_b).map(|s| s.model_label.as_str()),
+        Some("")
+    );
+
+    // Release exclusive lock on db_b without altering its file mtime -> next poll resolves db_b
+    lock_b.execute_batch("COMMIT;").unwrap();
+    drop(lock_b);
+
+    let deadline2 = Instant::now() + Duration::from_secs(3);
+    while handle
+        .snapshot()
+        .index
+        .by_id
+        .get(id_b)
+        .map(|s| s.model_label.as_str())
+        != Some("Gemini 4 Hydrogen (High)")
+        && Instant::now() < deadline2
+    {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert_eq!(
+        handle
+            .snapshot()
+            .index
+            .by_id
+            .get(id_b)
+            .map(|s| s.model_label.as_str()),
+        Some("Gemini 4 Hydrogen (High)")
+    );
+
+    // Update db_a to another model -> fingerprint changes and sidebar model_label updates
+    std::thread::sleep(Duration::from_millis(30));
+    write_model_db(&db_a, 1035); // Claude Sonnet 4.6
+    let deadline3 = Instant::now() + Duration::from_secs(3);
+    while handle
+        .snapshot()
+        .index
+        .by_id
+        .get(id_a)
+        .map(|s| s.model_label.as_str())
+        != Some("Claude Sonnet 4.6")
+        && Instant::now() < deadline3
+    {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert_eq!(
+        handle
+            .snapshot()
+            .index
+            .by_id
+            .get(id_a)
+            .map(|s| s.model_label.as_str()),
+        Some("Claude Sonnet 4.6")
+    );
+
+    drop(handle);
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agy_core::analyzer::{ConversationAnalysis, StepSummary};
+use agy_core::models::format_model_short_label;
 use agy_core::monitor::{MonitorCommand, MonitorConfig, MonitorHandle, MonitorSnapshot};
 use agy_core::paths::GeminiPaths;
 use agy_core::sessions::SessionSummary;
@@ -352,18 +353,67 @@ impl AgyMonitorApp {
                                 } else {
                                     String::new()
                                 };
-                                let label_text = format!(
-                                    "{}{}\n{} · {}",
-                                    truncate_ui(&root.display_title, 34),
-                                    sub_tag,
-                                    if root.project_label.is_empty() {
-                                        root.surface.label()
-                                    } else {
-                                        &root.project_label
+                                let short_model = format_model_short_label(&root.model_label);
+                                let proj_or_surface = if root.project_label.is_empty() {
+                                    root.surface.label()
+                                } else {
+                                    &root.project_label
+                                };
+
+                                let mut job = egui::text::LayoutJob::default();
+                                job.append(
+                                    &truncate_ui(
+                                        &root.display_title,
+                                        if short_model.is_empty() { 34 } else { 26 },
+                                    ),
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: egui::FontId::proportional(13.0),
+                                        color: palette.text_primary,
+                                        ..Default::default()
                                     },
-                                    time_str
                                 );
-                                let resp = ui.selectable_label(is_selected, label_text);
+                                if !short_model.is_empty() {
+                                    job.append(
+                                        &format!("  {short_model}"),
+                                        0.0,
+                                        egui::TextFormat {
+                                            font_id: egui::FontId::proportional(11.5),
+                                            color: palette.accent,
+                                            ..Default::default()
+                                        },
+                                    );
+                                }
+                                if !sub_tag.is_empty() {
+                                    job.append(
+                                        &sub_tag,
+                                        0.0,
+                                        egui::TextFormat {
+                                            font_id: egui::FontId::proportional(11.5),
+                                            color: palette.text_muted,
+                                            ..Default::default()
+                                        },
+                                    );
+                                }
+                                job.append(
+                                    &format!("\n{proj_or_surface} · {time_str}"),
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: egui::FontId::proportional(11.5),
+                                        color: palette.text_muted,
+                                        ..Default::default()
+                                    },
+                                );
+
+                                let mut resp = ui.selectable_label(is_selected, job);
+                                if !root.model_label.is_empty() {
+                                    resp = resp.on_hover_text(format!(
+                                        "{}\nモデル: {}",
+                                        root.display_title, root.model_label
+                                    ));
+                                } else {
+                                    resp = resp.on_hover_text(&root.display_title);
+                                }
                                 if resp.clicked() {
                                     self.monitor.send(MonitorCommand::SetFollowLatest(false));
                                     self.monitor.send(MonitorCommand::SelectConversation(Some(
@@ -383,13 +433,58 @@ impl AgyMonitorApp {
                                         snap.selected_id.as_deref() == Some(&child.conversation_id);
                                     ui.horizontal(|ui| {
                                         ui.add_space(26.0);
-                                        let label_text = format!(
-                                            "↳ {} ({})",
-                                            truncate_ui(&child.display_title, 26),
-                                            format_mtime_short(child.effective_mtime_ms)
+                                        let short_model =
+                                            format_model_short_label(&child.model_label);
+                                        let mut job = egui::text::LayoutJob::default();
+                                        job.append(
+                                            &format!(
+                                                "↳ {}",
+                                                truncate_ui(
+                                                    &child.display_title,
+                                                    if short_model.is_empty() { 26 } else { 20 }
+                                                )
+                                            ),
+                                            0.0,
+                                            egui::TextFormat {
+                                                font_id: egui::FontId::proportional(12.5),
+                                                color: palette.text_primary,
+                                                ..Default::default()
+                                            },
                                         );
-                                        if ui.selectable_label(child_selected, label_text).clicked()
-                                        {
+                                        if !short_model.is_empty() {
+                                            job.append(
+                                                &format!("  {short_model}"),
+                                                0.0,
+                                                egui::TextFormat {
+                                                    font_id: egui::FontId::proportional(11.0),
+                                                    color: palette.accent,
+                                                    ..Default::default()
+                                                },
+                                            );
+                                        }
+                                        job.append(
+                                            &format!(
+                                                " ({})",
+                                                format_mtime_short(child.effective_mtime_ms)
+                                            ),
+                                            0.0,
+                                            egui::TextFormat {
+                                                font_id: egui::FontId::proportional(11.0),
+                                                color: palette.text_muted,
+                                                ..Default::default()
+                                            },
+                                        );
+
+                                        let mut resp = ui.selectable_label(child_selected, job);
+                                        if !child.model_label.is_empty() {
+                                            resp = resp.on_hover_text(format!(
+                                                "{}\nモデル: {}",
+                                                child.display_title, child.model_label
+                                            ));
+                                        } else {
+                                            resp = resp.on_hover_text(&child.display_title);
+                                        }
+                                        if resp.clicked() {
                                             self.monitor
                                                 .send(MonitorCommand::SetFollowLatest(false));
                                             self.monitor.send(MonitorCommand::SelectConversation(
@@ -435,19 +530,44 @@ impl AgyMonitorApp {
                 .map(|s| s.display_title.as_str())
                 .unwrap_or(&analysis.conversation_id);
 
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    self.render_session_header(ctx, ui, title, summary, analysis, palette);
-                    ui.add_space(8.0);
-                    self.render_kpi_cards(ui, analysis, palette);
-                    ui.add_space(8.0);
-                    self.render_buckets_bar(ui, analysis, palette);
-                    ui.add_space(10.0);
-                    self.render_plots(ui, analysis, palette);
-                    ui.add_space(10.0);
-                    self.render_bottom_details(ui, analysis, palette);
-                });
+            let avail_w = ui.available_width();
+            let avail_h = ui.available_height();
+            let side_by_side = avail_w >= 540.0;
+            let plot_h = if avail_h >= 760.0 {
+                185.0
+            } else if avail_h >= 620.0 {
+                150.0
+            } else {
+                125.0
+            };
+
+            let render_monitor_section = |ui: &mut egui::Ui, app: &mut Self| {
+                app.render_session_header(ctx, ui, title, summary, analysis, palette);
+                ui.add_space(8.0);
+                app.render_kpi_cards(ui, analysis, palette);
+                ui.add_space(8.0);
+                app.render_buckets_bar(ui, analysis, palette);
+                ui.add_space(10.0);
+                app.render_plots(ui, analysis, palette, plot_h);
+            };
+
+            // Keep the monitor section fixed at the top while scrolling STEP details below.
+            // Only apply an upper height cap when narrow + short screens stack plots vertically.
+            if !side_by_side && avail_h < 620.0 {
+                egui::ScrollArea::vertical()
+                    .id_salt("monitor_compact_fallback")
+                    .auto_shrink([false, true])
+                    .max_height((avail_h - 160.0).max(180.0))
+                    .show(ui, |ui| {
+                        render_monitor_section(ui, self);
+                    });
+            } else {
+                render_monitor_section(ui, self);
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            self.render_bottom_details(ui, analysis, palette);
         });
     }
 
@@ -462,7 +582,25 @@ impl AgyMonitorApp {
     ) {
         ui.horizontal_wrapped(|ui| {
             ui.heading(title);
-            ui.add_space(6.0);
+            ui.add_space(4.0);
+
+            egui::Frame::new()
+                .fill(palette.bg_subtle)
+                .stroke(egui::Stroke::new(1.0, palette.border))
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(6, 2))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&analysis.model.model_label)
+                                .color(palette.accent)
+                                .strong(),
+                        )
+                        .extend(),
+                    );
+                });
+
+            ui.add_space(4.0);
 
             let copied_active = self.copied_until.is_some_and(|t| t > Instant::now());
             let copy_lbl = if copied_active {
@@ -491,8 +629,7 @@ impl AgyMonitorApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} · 上限 {} ({})",
-                        analysis.model.model_label,
+                        "上限 {} ({})",
                         format_tokens(analysis.context_limit),
                         analysis.model.limit_source
                     ))
@@ -718,7 +855,13 @@ impl AgyMonitorApp {
             });
     }
 
-    fn render_plots(&self, ui: &mut egui::Ui, analysis: &ConversationAnalysis, palette: &Palette) {
+    fn render_plots(
+        &self,
+        ui: &mut egui::Ui,
+        analysis: &ConversationAnalysis,
+        palette: &Palette,
+        plot_h: f32,
+    ) {
         let avail = ui.available_width();
         let side_by_side = avail >= 540.0;
         let plot_w = if side_by_side {
@@ -739,8 +882,11 @@ impl AgyMonitorApp {
                     .collect();
 
                 Plot::new("ctx_history_plot")
-                    .height(190.0)
+                    .height(plot_h)
                     .width(plot_w)
+                    .allow_scroll(false)
+                    .allow_zoom(false)
+                    .allow_drag(false)
                     .include_y(0.0)
                     .include_y(analysis.context_limit as f64 * 1.05)
                     .legend(Legend::default().position(Corner::LeftTop))
@@ -785,8 +931,11 @@ impl AgyMonitorApp {
                     .collect();
 
                 Plot::new("cache_history_plot")
-                    .height(190.0)
+                    .height(plot_h)
                     .width(plot_w)
+                    .allow_scroll(false)
+                    .allow_zoom(false)
+                    .allow_drag(false)
                     .include_y(0.0)
                     .include_y(100.0)
                     .legend(Legend::default().position(Corner::LeftBottom))
@@ -864,9 +1013,9 @@ impl AgyMonitorApp {
                         egui::RichText::new("ステップ記録はありません").color(palette.text_muted),
                     );
                 } else {
-                    egui::ScrollArea::horizontal()
-                        .id_salt("steps_table_hscroll")
-                        .auto_shrink([false, true])
+                    egui::ScrollArea::both()
+                        .id_salt("steps_table_scroll")
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             egui::Grid::new("steps_table")
                                 .striped(true)
@@ -934,9 +1083,9 @@ impl AgyMonitorApp {
                             .color(palette.text_muted),
                     );
                 } else {
-                    egui::ScrollArea::horizontal()
-                        .id_salt("heavy_tools_hscroll")
-                        .auto_shrink([false, true])
+                    egui::ScrollArea::both()
+                        .id_salt("heavy_tools_scroll")
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             egui::Grid::new("heavy_tools_table")
                                 .striped(true)
@@ -1122,6 +1271,7 @@ fn session_matches_query(s: &SessionSummary, q: &str) -> bool {
         || s.conversation_id.to_lowercase().contains(q)
         || s.project_label.to_lowercase().contains(q)
         || s.agent_name.to_lowercase().contains(q)
+        || s.model_label.to_lowercase().contains(q)
 }
 
 fn truncate_ui(text: &str, max_chars: usize) -> String {
@@ -1206,6 +1356,7 @@ mod tests {
             effective_mtime_ms: 1_700_000_000_000,
             has_transcript: true,
             has_db: true,
+            model_label: "Claude Opus 4.6 (High)".to_string(),
         };
         let sub_sum = SessionSummary {
             conversation_id: sub_id.clone(),
@@ -1214,6 +1365,7 @@ mod tests {
             parent_conversation_id: conv_id.clone(),
             is_subagent: true,
             nesting_depth: 1,
+            model_label: "Gemini Flash Worker".to_string(),
             ..root_sum.clone()
         };
 
@@ -1774,6 +1926,209 @@ mod tests {
             texts_empty
                 .iter()
                 .any(|(t, _, _)| t == "ステップ記録はありません")
+        );
+    }
+
+    #[test]
+    fn gui_06_step_scroll_keeps_monitor_and_plots_fixed() {
+        let (_tmp, mut app) = make_test_app();
+        let mut snap = sample_snapshot();
+        if let Some(a) = snap.analysis.as_mut() {
+            a.step_summaries = (0..60)
+                .map(|i| StepSummary {
+                    step_index: i,
+                    step_type: "PLANNER_RESPONSE".to_string(),
+                    source: "MODEL".to_string(),
+                    status: "DONE".to_string(),
+                    created_at: Some("2026-11-22T15:01:00Z".to_string()),
+                    prompt_tokens: 1000,
+                    uncached_tokens: 100,
+                    cached_tokens: 900,
+                    output_tokens: 50,
+                    est_tokens: 1000,
+                    compacted: false,
+                    summary: format!("scroll-step-{i}"),
+                })
+                .collect();
+            a.step_count = 60;
+        }
+
+        let ctx = egui::Context::default();
+        install_japanese_fonts(&ctx);
+        apply_theme(&ctx, ThemeMode::Dark);
+
+        let viewport = egui::vec2(1240.0, 820.0);
+        let run_frame = |app: &mut AgyMonitorApp, events: Vec<egui::Event>| {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw_input, |ui| {
+                app.render_ui(ui, &snap);
+            });
+            let texts = collect_rendered_texts(&output.shapes);
+            output.textures_delta.clear();
+            texts
+        };
+
+        let _ = run_frame(&mut app, vec![]);
+        let before = run_frame(&mut app, vec![]);
+
+        let find_y = |texts: &[(String, egui::Rect, egui::Rect)], needle: &str| {
+            texts
+                .iter()
+                .find(|(t, _, _)| t == needle)
+                .unwrap_or_else(|| panic!("missing text '{needle}'"))
+                .1
+                .top()
+        };
+
+        let title = snap.index.by_id[snap.selected_id.as_ref().unwrap()]
+            .display_title
+            .as_str();
+        let header_y_before = find_y(&before, title);
+        let kpi_y_before = find_y(&before, "コンテキスト使用率");
+        let plot_y_before = find_y(&before, "コンテキスト推移");
+        let step59_rect = before
+            .iter()
+            .find(|(t, _, _)| t == "scroll-step-59")
+            .expect("scroll-step-59 visible initially")
+            .1;
+        let step59_y_before = step59_rect.top();
+
+        // Scroll downward with pointer positioned inside the STEP table
+        let hover_pos = step59_rect.center();
+        let _ = run_frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(hover_pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -240.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let after = run_frame(&mut app, vec![]);
+
+        assert!(
+            (find_y(&after, title) - header_y_before).abs() < 0.1,
+            "session header moved during STEP scroll"
+        );
+        assert!(
+            (find_y(&after, "コンテキスト使用率") - kpi_y_before).abs() < 0.1,
+            "KPI card moved during STEP scroll"
+        );
+        assert!(
+            (find_y(&after, "コンテキスト推移") - plot_y_before).abs() < 0.1,
+            "plot heading moved during STEP scroll"
+        );
+
+        let step59_y_after = after
+            .iter()
+            .find(|(t, _, _)| t == "scroll-step-59")
+            .map(|(_, r, _)| r.top());
+        assert!(
+            step59_y_after.is_none_or(|y| y < step59_y_before - 20.0),
+            "expected STEP rows to scroll upward (before={step59_y_before}, after={step59_y_after:?})"
+        );
+    }
+
+    #[test]
+    fn gui_07_model_label_right_of_session_titles() {
+        let (_tmp, mut app) = make_test_app();
+        let mut snap = sample_snapshot();
+        let root_id = snap.selected_id.clone().unwrap();
+        let short_title = "セッションタイトル検証";
+        if let Some(s) = snap.index.by_id.get_mut(&root_id) {
+            s.display_title = short_title.to_string();
+        }
+        if let Some(node) = snap.index.roots.first_mut() {
+            node.summary.display_title = short_title.to_string();
+        }
+        app.expanded_roots.insert(root_id);
+
+        let ctx = egui::Context::default();
+        install_japanese_fonts(&ctx);
+        apply_theme(&ctx, ThemeMode::Dark);
+
+        let viewport = egui::vec2(1240.0, 820.0);
+        let run_frame = |app: &mut AgyMonitorApp, s: &MonitorSnapshot| {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw_input, |ui| {
+                app.render_ui(ui, s);
+            });
+            let texts = collect_rendered_texts(&output.shapes);
+            output.textures_delta.clear();
+            texts
+        };
+
+        let _ = run_frame(&mut app, &snap);
+        let texts = run_frame(&mut app, &snap);
+
+        // 1. Right pane header: single-line model label immediately right of title and before IDコピー
+        let header_title = texts
+            .iter()
+            .find(|(t, r, _)| t == short_title && r.left() > 280.0)
+            .expect("header title in main pane")
+            .1;
+        let header_model = texts
+            .iter()
+            .find(|(t, r, _)| t == "Claude Opus 4.6 (High)" && r.left() > 280.0)
+            .expect("model label badge in header")
+            .1;
+        let id_copy = texts
+            .iter()
+            .find(|(t, r, _)| t == "IDコピー" && r.left() > 280.0)
+            .expect("IDコピー button in header")
+            .1;
+        assert!(
+            header_model.left() >= header_title.right() - 1.0,
+            "model badge ({header_model:?}) must be right of title ({header_title:?})"
+        );
+        assert!(
+            (header_model.center().y - header_title.center().y).abs() < 4.0,
+            "model badge ({header_model:?}) must sit on same line as title ({header_title:?})"
+        );
+        assert!(
+            header_model.right() <= id_copy.left() + 1.0,
+            "model badge ({header_model:?}) must precede IDコピー ({id_copy:?})"
+        );
+
+        // 2. Sidebar root & subagent rows include short model label in their rendered LayoutJob text
+        let sidebar_root = texts
+            .iter()
+            .find(|(t, r, _)| r.left() < 280.0 && t.contains("Claude Opus 4.6 (H)"))
+            .expect("root sidebar entry should contain short model label");
+        assert!(sidebar_root.0.contains(short_title));
+
+        let sidebar_sub = texts
+            .iter()
+            .find(|(t, r, _)| {
+                r.left() < 280.0 && t.contains("↳ research") && t.contains("Flash Worker")
+            })
+            .expect("subagent sidebar entry should contain short model label");
+        assert!(sidebar_sub.0.find("↳ research") < sidebar_sub.0.find("Flash Worker"));
+
+        // 3. Even with a long title, the model badge stays single-line (never breaks mid-badge)
+        let long_snap = sample_snapshot();
+        let _ = run_frame(&mut app, &long_snap);
+        let long_texts = run_frame(&mut app, &long_snap);
+        let long_badge = long_texts
+            .iter()
+            .find(|(t, r, _)| t == "Claude Opus 4.6 (High)" && r.left() > 280.0)
+            .expect("long-title header must still render unbroken single-line model badge")
+            .1;
+        assert!(
+            long_badge.height() <= 22.0,
+            "model badge must stay single-line, got height={}",
+            long_badge.height()
         );
     }
 }
