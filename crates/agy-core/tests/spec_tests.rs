@@ -811,8 +811,29 @@ fn mon_01_poller_fingerprint_skip_commands_and_drop_join() {
     assert!(snap_resumed.follow_latest);
     assert_eq!(snap_resumed.selected_id.as_deref(), Some(newer_id));
 
-    // Pause, RefreshNow, Drop cleanly joins
+    // Pause, then SelectConversation(Some(older_id)) while paused -> still sets follow_latest=false and selects older_id
     handle.send(MonitorCommand::SetPaused(true));
+    let deadline_pause = Instant::now() + Duration::from_secs(2);
+    while !handle.snapshot().paused && Instant::now() < deadline_pause {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.snapshot().paused);
+    handle.send(MonitorCommand::SelectConversation(Some(
+        older_id.to_string(),
+    )));
+    let deadline_paused_sel = Instant::now() + Duration::from_secs(2);
+    while (handle.snapshot().follow_latest
+        || handle.snapshot().selected_id.as_deref() != Some(older_id))
+        && Instant::now() < deadline_paused_sel
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let snap_paused_sel = handle.snapshot();
+    assert!(snap_paused_sel.paused);
+    assert!(!snap_paused_sel.follow_latest);
+    assert_eq!(snap_paused_sel.selected_id.as_deref(), Some(older_id));
+
+    // RefreshNow while paused still works, Drop cleanly joins
     handle.send(MonitorCommand::RefreshNow);
     std::thread::sleep(Duration::from_millis(50));
     assert!(notify_count.load(Ordering::SeqCst) >= 2);

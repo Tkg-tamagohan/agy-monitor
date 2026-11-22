@@ -840,72 +840,92 @@ impl AgyMonitorApp {
                 ui.separator();
                 ui.selectable_value(&mut self.steps_newest_first, true, "最新順");
                 ui.selectable_value(&mut self.steps_newest_first, false, "昇順");
+                let total_steps = analysis.step_summaries.len();
+                if total_steps > 200 {
+                    let cap_note = if self.steps_newest_first {
+                        format!("表示: 最新 200 / {total_steps} 件")
+                    } else {
+                        format!("表示: 先頭 200 / {total_steps} 件")
+                    };
+                    ui.label(
+                        egui::RichText::new(cap_note)
+                            .small()
+                            .color(palette.text_muted),
+                    );
+                }
             }
         });
         ui.separator();
 
         match self.detail_tab {
             DetailTab::Steps => {
-                egui::ScrollArea::horizontal()
-                    .id_salt("steps_table_hscroll")
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        egui::Grid::new("steps_table")
-                            .striped(true)
-                            .num_columns(10)
-                            .spacing([10.0, 4.0])
-                            .show(ui, |ui| {
-                                ui.strong("Step#");
-                                ui.strong("種別");
-                                ui.strong("時刻");
-                                ui.strong("Prompt");
-                                ui.strong("Cached");
-                                ui.strong("Uncached");
-                                ui.strong("Hit%");
-                                ui.strong("Output");
-                                ui.strong("Compaction");
-                                ui.strong("概要");
-                                ui.end_row();
-
-                                let rows: Box<dyn Iterator<Item = &StepSummary>> =
-                                    if self.steps_newest_first {
-                                        Box::new(analysis.step_summaries.iter().rev().take(200))
-                                    } else {
-                                        Box::new(analysis.step_summaries.iter().take(200))
-                                    };
-
-                                for st in rows {
-                                    ui.monospace(st.step_index.to_string());
-                                    ui.label(&st.step_type);
-                                    ui.monospace(format_step_time(st.created_at.as_deref()));
-                                    ui.monospace(format_tokens(st.prompt_tokens));
-                                    ui.monospace(format_tokens(st.cached_tokens));
-                                    ui.monospace(format_tokens(st.uncached_tokens));
-                                    let hit_text = if st.prompt_tokens > 0 {
-                                        format!("{:.1}%", st.cache_hit_percent())
-                                    } else {
-                                        "-".to_string()
-                                    };
-                                    ui.monospace(hit_text);
-                                    ui.monospace(format_tokens(st.output_tokens));
-                                    if st.compacted {
-                                        ui.label(
-                                            egui::RichText::new("圧縮")
-                                                .strong()
-                                                .color(palette.warn),
-                                        );
-                                    } else {
-                                        ui.label(
-                                            egui::RichText::new("-").color(palette.text_muted),
-                                        );
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(&st.summary).color(palette.text_muted),
-                                    );
+                if analysis.step_summaries.is_empty() {
+                    ui.label(
+                        egui::RichText::new("ステップ記録はありません").color(palette.text_muted),
+                    );
+                } else {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("steps_table_hscroll")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            egui::Grid::new("steps_table")
+                                .striped(true)
+                                .num_columns(10)
+                                .spacing([10.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.strong("Step#");
+                                    ui.strong("種別");
+                                    ui.strong("時刻");
+                                    ui.strong("Prompt");
+                                    ui.strong("Cached");
+                                    ui.strong("Uncached");
+                                    ui.strong("Hit%");
+                                    ui.strong("Output");
+                                    ui.strong("Compaction");
+                                    ui.strong("概要");
                                     ui.end_row();
-                                }
-                            });
-                    });
+
+                                    let rows: Box<dyn Iterator<Item = &StepSummary>> =
+                                        if self.steps_newest_first {
+                                            Box::new(analysis.step_summaries.iter().rev().take(200))
+                                        } else {
+                                            Box::new(analysis.step_summaries.iter().take(200))
+                                        };
+
+                                    for st in rows {
+                                        ui.monospace(st.step_index.to_string());
+                                        ui.label(&st.step_type);
+                                        ui.monospace(format_step_time(st.created_at.as_deref()));
+                                        ui.monospace(format_tokens(st.prompt_tokens));
+                                        ui.monospace(format_tokens(st.cached_tokens));
+                                        ui.monospace(format_tokens(st.uncached_tokens));
+                                        let hit_text = if st.prompt_tokens > 0 {
+                                            format!("{:.1}%", st.cache_hit_percent())
+                                        } else {
+                                            "-".to_string()
+                                        };
+                                        ui.monospace(hit_text);
+                                        ui.monospace(format_tokens(st.output_tokens));
+                                        if st.compacted {
+                                            ui.label(
+                                                egui::RichText::new("圧縮")
+                                                    .strong()
+                                                    .color(palette.warn),
+                                            );
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new("-").color(palette.text_muted),
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(truncate_ui(&st.summary, 120))
+                                                .color(palette.text_muted),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
             }
             DetailTab::HeavyTools => {
                 if analysis.heavy_tool_calls.is_empty() {
@@ -1478,40 +1498,43 @@ mod tests {
             app.theme_mode = theme;
             apply_theme(&ctx, theme);
 
-            let raw_input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(760.0, 520.0),
-                )),
-                ..Default::default()
-            };
-            let mut output = ctx.run_ui(raw_input, |ui| {
-                app.render_ui(ui, &snap);
-            });
-            let shapes_len = output.shapes.len();
-            assert!(
-                output
-                    .shapes
-                    .iter()
-                    .all(|s| s.clip_rect.right() <= 760.5 && s.clip_rect.bottom() <= 520.5),
-                "narrow layout emitted shapes clipped beyond viewport"
-            );
-            output.textures_delta.clear();
-            assert!(shapes_len > 0);
+            for _ in 0..2 {
+                let raw_input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(760.0, 520.0),
+                    )),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(raw_input, |ui| {
+                    app.render_ui(ui, &snap);
+                });
+                let shapes_len = output.shapes.len();
+                assert!(
+                    output
+                        .shapes
+                        .iter()
+                        .all(|s| s.clip_rect.right() <= 760.5 && s.clip_rect.bottom() <= 520.5),
+                    "narrow layout emitted shapes clipped beyond viewport"
+                );
+                output.textures_delta.clear();
+                assert!(shapes_len > 0);
+            }
         }
     }
 
     fn collect_rendered_texts(
         shapes: &[egui::epaint::ClippedShape],
-    ) -> Vec<(String, egui::Pos2, egui::Rect)> {
+    ) -> Vec<(String, egui::Rect, egui::Rect)> {
         fn walk_shape(
             shape: &egui::epaint::Shape,
             clip_rect: egui::Rect,
-            out: &mut Vec<(String, egui::Pos2, egui::Rect)>,
+            out: &mut Vec<(String, egui::Rect, egui::Rect)>,
         ) {
             match shape {
                 egui::epaint::Shape::Text(ts) => {
-                    out.push((ts.galley.text().to_string(), ts.pos, clip_rect));
+                    let rect = egui::Rect::from_min_size(ts.pos, ts.galley.size());
+                    out.push((ts.galley.text().to_string(), rect, clip_rect));
                 }
                 egui::epaint::Shape::Vec(children) => {
                     for child in children {
@@ -1538,36 +1561,35 @@ mod tests {
         apply_theme(&ctx, ThemeMode::Dark);
 
         let viewport = egui::vec2(1400.0, 1400.0);
-        let run_frame = |app: &mut AgyMonitorApp, events: Vec<egui::Event>| {
+        let run_frame = |app: &mut AgyMonitorApp, s: &MonitorSnapshot, events: Vec<egui::Event>| {
             let raw_input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
                 events,
                 ..Default::default()
             };
-            let mut asc_pos = None;
-            let mut desc_pos = None;
             let output = ctx.run_ui(raw_input, |ui| {
-                app.render_ui(ui, &snap);
+                app.render_ui(ui, s);
             });
             let texts = collect_rendered_texts(&output.shapes);
-            for (txt, pos, _clip) in &texts {
-                if txt == "昇順" {
-                    asc_pos = Some(*pos);
-                } else if txt == "最新順" {
-                    desc_pos = Some(*pos);
-                }
-            }
+            let asc_pos = texts
+                .iter()
+                .find(|(txt, _, _)| txt == "昇順")
+                .map(|(_, rect, _)| rect.center());
+            let desc_pos = texts
+                .iter()
+                .find(|(txt, _, _)| txt == "最新順")
+                .map(|(_, rect, _)| rect.center());
             let mut output = output;
             output.textures_delta.clear();
             (texts, asc_pos, desc_pos)
         };
 
         // Frame 1 & 2 (allow layout to settle): default newest-first ("最新順")
-        let _ = run_frame(&mut app, vec![]);
-        let (texts_desc, asc_pos, _desc_pos) = run_frame(&mut app, vec![]);
+        let _ = run_frame(&mut app, &snap, vec![]);
+        let (texts_desc, asc_pos, _desc_pos) = run_frame(&mut app, &snap, vec![]);
         assert!(app.steps_newest_first);
 
-        // Verify all 10 column headers and sort toggle labels rendered within clip_rect
+        // Verify all 10 column headers, sort toggles, and new cell values rendered completely unclipped
         for required in [
             "最新順",
             "昇順",
@@ -1585,12 +1607,16 @@ mod tests {
             "83.3%", // Hit% on step 1 (100k / 120k)
             "圧縮",  // Compaction badge on step 2
         ] {
-            let found = texts_desc
-                .iter()
-                .find(|(t, pos, clip)| t == required && clip.contains(*pos + egui::vec2(1.0, 1.0)));
+            let found = texts_desc.iter().find(|(t, rect, clip)| {
+                t == required
+                    && rect.left() >= clip.left() - 0.5
+                    && rect.right() <= clip.right() + 0.5
+                    && rect.top() >= clip.top() - 0.5
+                    && rect.bottom() <= clip.bottom() + 0.5
+            });
             assert!(
                 found.is_some(),
-                "expected '{required}' to be rendered unclipped in Steps table; texts={:?}",
+                "expected '{required}' to be rendered fully unclipped in Steps table; texts={:?}",
                 texts_desc.iter().map(|(t, _, _)| t).collect::<Vec<_>>()
             );
         }
@@ -1600,22 +1626,23 @@ mod tests {
             .find(|(t, _, _)| t == "init-step-0")
             .expect("init-step-0 rendered")
             .1
-            .y;
+            .top();
         let y_step3_desc = texts_desc
             .iter()
             .find(|(t, _, _)| t == "done-step-3")
             .expect("done-step-3 rendered")
             .1
-            .y;
+            .top();
         assert!(
             y_step3_desc < y_step0_desc,
             "newest-first must place step 3 ({y_step3_desc}) above step 0 ({y_step0_desc})"
         );
 
         // Click the "昇順" toggle button via pointer events
-        let click_pos = asc_pos.expect("昇順 button position") + egui::vec2(8.0, 6.0);
+        let click_pos = asc_pos.expect("昇順 button position");
         let _ = run_frame(
             &mut app,
+            &snap,
             vec![
                 egui::Event::PointerMoved(click_pos),
                 egui::Event::PointerButton {
@@ -1637,28 +1664,29 @@ mod tests {
             "clicking '昇順' must switch steps_newest_first to false"
         );
 
-        let (texts_asc, _, desc_pos) = run_frame(&mut app, vec![]);
+        let (texts_asc, _, desc_pos) = run_frame(&mut app, &snap, vec![]);
         let y_step0_asc = texts_asc
             .iter()
             .find(|(t, _, _)| t == "init-step-0")
             .expect("init-step-0 rendered in asc")
             .1
-            .y;
+            .top();
         let y_step3_asc = texts_asc
             .iter()
             .find(|(t, _, _)| t == "done-step-3")
             .expect("done-step-3 rendered in asc")
             .1
-            .y;
+            .top();
         assert!(
             y_step0_asc < y_step3_asc,
             "ascending sort must place step 0 ({y_step0_asc}) above step 3 ({y_step3_asc})"
         );
 
         // Click "最新順" back to true and verify order flips back
-        let click_desc = desc_pos.expect("最新順 button position") + egui::vec2(8.0, 6.0);
+        let click_desc = desc_pos.expect("最新順 button position");
         let _ = run_frame(
             &mut app,
+            &snap,
             vec![
                 egui::Event::PointerMoved(click_desc),
                 egui::Event::PointerButton {
@@ -1679,19 +1707,73 @@ mod tests {
             app.steps_newest_first,
             "clicking '最新順' must switch steps_newest_first back to true"
         );
-        let (texts_back, _, _) = run_frame(&mut app, vec![]);
+        let (texts_back, _, _) = run_frame(&mut app, &snap, vec![]);
         let y_step0_back = texts_back
             .iter()
             .find(|(t, _, _)| t == "init-step-0")
             .unwrap()
             .1
-            .y;
+            .top();
         let y_step3_back = texts_back
             .iter()
             .find(|(t, _, _)| t == "done-step-3")
             .unwrap()
             .1
-            .y;
+            .top();
         assert!(y_step3_back < y_step0_back);
+
+        // >200 steps cap notice & slice boundaries in both sort orders
+        let mut snap_many = sample_snapshot();
+        if let Some(a) = snap_many.analysis.as_mut() {
+            a.step_summaries = (0..205)
+                .map(|i| StepSummary {
+                    step_index: i,
+                    step_type: "PLANNER_RESPONSE".to_string(),
+                    source: "MODEL".to_string(),
+                    status: "DONE".to_string(),
+                    created_at: None,
+                    prompt_tokens: 1000,
+                    uncached_tokens: 100,
+                    cached_tokens: 900,
+                    output_tokens: 50,
+                    est_tokens: 1000,
+                    compacted: false,
+                    summary: format!("bulk-step-{i}"),
+                })
+                .collect();
+            a.step_count = 205;
+        }
+        app.steps_newest_first = true;
+        let (texts_many_desc, _, _) = run_frame(&mut app, &snap_many, vec![]);
+        assert!(
+            texts_many_desc
+                .iter()
+                .any(|(t, _, _)| t == "表示: 最新 200 / 205 件")
+        );
+        assert!(texts_many_desc.iter().any(|(t, _, _)| t == "bulk-step-204"));
+        assert!(!texts_many_desc.iter().any(|(t, _, _)| t == "bulk-step-0"));
+
+        app.steps_newest_first = false;
+        let (texts_many_asc, _, _) = run_frame(&mut app, &snap_many, vec![]);
+        assert!(
+            texts_many_asc
+                .iter()
+                .any(|(t, _, _)| t == "表示: 先頭 200 / 205 件")
+        );
+        assert!(texts_many_asc.iter().any(|(t, _, _)| t == "bulk-step-0"));
+        assert!(!texts_many_asc.iter().any(|(t, _, _)| t == "bulk-step-204"));
+
+        // Empty step_summaries renders empty-state label without panic
+        let mut snap_empty = sample_snapshot();
+        if let Some(a) = snap_empty.analysis.as_mut() {
+            a.step_summaries.clear();
+            a.step_count = 0;
+        }
+        let (texts_empty, _, _) = run_frame(&mut app, &snap_empty, vec![]);
+        assert!(
+            texts_empty
+                .iter()
+                .any(|(t, _, _)| t == "ステップ記録はありません")
+        );
     }
 }
