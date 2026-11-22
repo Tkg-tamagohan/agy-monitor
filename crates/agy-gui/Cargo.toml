@@ -1,0 +1,15 @@
+[package]
+name = "agy-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agy-monitor"
+path = "src/main.rs"
+
+[dependencies]
+agy-core = { path = "../agy-core" }
+chrono.workspace = true
+eframe.workspace = true
+egui_plot.workspace = true

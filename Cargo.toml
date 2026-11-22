@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agy-core",
+    "crates/agy-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+url = "2"
+eframe = "0.37"
+egui_plot = "0.38"
