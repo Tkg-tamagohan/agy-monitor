@@ -1600,3 +1600,151 @@ fn mon_05_backfill_avoids_index_reloads_and_stops_on_busy_session() {
     lock_conn.execute_batch("COMMIT;").unwrap();
     drop(lock_conn);
 }
+
+#[test]
+fn mon_06_backfill_keeps_fresh_selected_model_when_db_changes() {
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    let conv_dir = app.join("conversations");
+    std::fs::create_dir_all(&conv_dir).unwrap();
+
+    let base_mtime = SystemTime::now() - Duration::from_secs(600);
+    let write_session = |id: &str, model_id: u64, mtime: SystemTime| -> std::path::PathBuf {
+        let logs = app
+            .join("brain")
+            .join(id)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let transcript_path = logs.join("transcript_full.jsonl");
+        std::fs::write(
+            &transcript_path,
+            format!("{{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"{id}\"}}\n"),
+        )
+        .unwrap();
+
+        let db_path = conv_dir.join(format!("{id}.db"));
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);")
+                .unwrap();
+            let mut step_model = Vec::new();
+            encode_varint_field(1, model_id, &mut step_model);
+            let mut step_meta = Vec::new();
+            encode_bytes_field(24, &step_model, &mut step_meta);
+            conn.execute(
+                "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+                [&step_meta],
+            )
+            .unwrap();
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript_path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&db_path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        db_path
+    };
+
+    // 41 background unlocked sessions (> MAX_MODEL_SCANS_PER_TICK = 40) + 1 newest selected session
+    // so Tick 1 schedules automatic 50ms backfill in run_poller.
+    let mut bg_ids = Vec::with_capacity(41);
+    for i in 1..=41usize {
+        let id = format!("22222222-0000-0000-0000-{i:012}");
+        write_session(&id, 1026, base_mtime + Duration::from_secs(i as u64)); // Claude Opus 4.6
+        bg_ids.push(id);
+    }
+
+    let sel_id = "00000000-0000-0000-0000-000000000000";
+    let sel_db_path = write_session(sel_id, 1026, base_mtime + Duration::from_secs(300));
+
+    let notify_count = Arc::new(AtomicUsize::new(0));
+    let mutated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let notify_clone = Arc::clone(&notify_count);
+    let mutated_clone = Arc::clone(&mutated);
+    let sel_db_clone = sel_db_path.clone();
+    let updated_mtime = base_mtime + Duration::from_secs(400);
+
+    let mut cfg = MonitorConfig::new(GeminiPaths::from_gemini_dir(&gemini));
+    cfg.poll_interval = Duration::from_secs(10);
+    cfg.notify = Some(Arc::new(move || {
+        let n = notify_clone.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == 1 {
+            // Mutate the selected session's DB right after Tick 1 publishes the initial snapshot
+            // and before run_poller enters the 50ms backfill tick.
+            {
+                let conn = Connection::open(&sel_db_clone).unwrap();
+                let mut step_model = Vec::new();
+                encode_varint_field(1, 1525, &mut step_model); // Gemini 4 Hydrogen (High)
+                let mut step_meta = Vec::new();
+                encode_bytes_field(24, &step_model, &mut step_meta);
+                conn.execute("UPDATE steps SET metadata = ?1 WHERE idx = 1", [&step_meta])
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO steps (idx, metadata) VALUES (2, ?1)",
+                    [&step_meta],
+                )
+                .unwrap();
+            }
+            std::fs::File::options()
+                .write(true)
+                .open(&sel_db_clone)
+                .unwrap()
+                .set_modified(updated_mtime)
+                .unwrap();
+            mutated_clone.store(true, Ordering::SeqCst);
+        }
+    }));
+    let handle = MonitorHandle::start(cfg);
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while notify_count.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(30));
+
+    assert!(mutated.load(Ordering::SeqCst));
+    assert_eq!(
+        handle.index_reload_count(),
+        1,
+        "Tick 2 must run via the 50ms backfill path without reloading the session index"
+    );
+    let snap = handle.snapshot();
+    assert_eq!(snap.selected_id.as_deref(), Some(sel_id));
+    assert_eq!(
+        snap.analysis.as_ref().map(|a| a.model.model_label.as_str()),
+        Some("Claude Opus 4.6"),
+        "cached_analysis remains stale during backfill tick"
+    );
+    assert_eq!(
+        snap.index.by_id.get(sel_id).map(|s| s.model_label.as_str()),
+        Some("Gemini 4 Hydrogen (High)"),
+        "backfill must keep fresh DB model label instead of overwriting with stale cached_analysis"
+    );
+    assert_eq!(
+        snap.index.roots[0].summary.model_label.as_str(),
+        "Gemini 4 Hydrogen (High)"
+    );
+    for id in &bg_ids {
+        assert_eq!(
+            snap.index.by_id.get(id).map(|s| s.model_label.as_str()),
+            Some("Claude Opus 4.6")
+        );
+    }
+    assert_eq!(
+        handle.model_scan_count(),
+        42,
+        "Tick 1 scans 40 background sessions; Tick 2 scans updated selected DB + 1 remaining background session"
+    );
+    assert_eq!(notify_count.load(Ordering::SeqCst), 2);
+
+    drop(handle);
+}
