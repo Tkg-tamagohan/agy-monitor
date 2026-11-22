@@ -532,7 +532,13 @@ pub fn extract_pbtxt_last_selected_model(pbtxt: &str) -> Option<String> {
     for line in pbtxt.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("last_selected_agent_model:") {
-            let val = rest.split_whitespace().next().unwrap_or("").trim();
+            let val = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
             if !val.is_empty() {
                 return Some(val.to_string());
             }

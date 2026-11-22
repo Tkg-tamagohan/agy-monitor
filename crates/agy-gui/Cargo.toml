@@ -13,3 +13,6 @@ agy-core = { path = "../agy-core" }
 chrono.workspace = true
 eframe.workspace = true
 egui_plot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

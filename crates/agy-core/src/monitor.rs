@@ -304,7 +304,9 @@ fn perform_poll(
                 match analyze_conversation(app_data, &conv_id, None, None) {
                     Ok(res) => {
                         analysis_db_busy = res.db_busy;
-                        *cached_key = Some(key);
+                        // Do not freeze the cache key if the DB was busy so the next poll
+                        // retries reading model/limit metadata once the lock clears.
+                        *cached_key = if res.db_busy { None } else { Some(key) };
                         *cached_analysis = Some(res);
                         *analysis_count += 1;
                     }

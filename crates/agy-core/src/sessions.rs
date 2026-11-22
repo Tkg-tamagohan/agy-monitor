@@ -496,8 +496,19 @@ fn read_summaries_for_root(root: &AppDataRoot) -> (Vec<RawSummaryRow>, bool) {
                 .trim()
                 .to_string();
             let nesting_depth: u32 = row.get::<_, i64>(7).unwrap_or(0).max(0) as u32;
-            let last_mod_str: String = row.get::<_, String>(8).unwrap_or_default();
-            let last_modified_ms = parse_datetime_ms(&last_mod_str);
+            let last_modified_ms = match row.get_ref(8) {
+                Ok(rusqlite::types::ValueRef::Text(bytes)) => {
+                    parse_datetime_ms(&String::from_utf8_lossy(bytes))
+                }
+                Ok(rusqlite::types::ValueRef::Integer(n)) => {
+                    if n > 0 && n < 10_000_000_000 {
+                        n * 1000
+                    } else {
+                        n.max(0)
+                    }
+                }
+                _ => 0,
+            };
 
             out.push(RawSummaryRow {
                 conversation_id: conv_id,

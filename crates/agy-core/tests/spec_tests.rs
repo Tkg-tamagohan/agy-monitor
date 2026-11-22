@@ -521,6 +521,24 @@ fn ctx_01_transcript_merge_torn_line_utf8_and_bucket_reconcile() {
     assert_eq!(b.active_total(), 1500);
     reconcile_active_buckets(&mut b, 500);
     assert_eq!(b.active_total(), 500);
+
+    // Torn invalid UTF-8 trailing bytes must not discard valid preceding lines
+    let mut torn_utf8_bytes = full_lines_bytes_for_test();
+    torn_utf8_bytes.extend_from_slice(&[0xe3, 0x81]); // incomplete UTF-8 sequence
+    std::fs::write(logs.join("transcript_full.jsonl"), torn_utf8_bytes).unwrap();
+    let res_utf8 = analyze_conversation(&app, conv_id, None, None).unwrap();
+    assert!(res_utf8.found);
+    assert!(res_utf8.step_count >= 2);
+}
+
+fn full_lines_bytes_for_test() -> Vec<u8> {
+    [
+        r#"{"step_index":0,"type":"USER_INPUT","content":"こんにちは"}"#,
+        r#"{"step_index":1,"type":"PLANNER_RESPONSE","input_tokens":1000,"cache_read_tokens":9000,"output_tokens":500,"content":"了解しました"}"#,
+        r#"{"step_index":2,"type":"USER_INPUT","content":"途中で切れた"#,
+    ]
+    .join("\n")
+    .into_bytes()
 }
 
 #[test]
@@ -693,6 +711,96 @@ fn mon_01_poller_fingerprint_skip_commands_and_drop_join() {
     std::thread::sleep(Duration::from_millis(50));
     assert!(notify_count.load(Ordering::SeqCst) >= 2);
     drop(handle);
+}
+
+#[test]
+fn mon_02_db_busy_does_not_freeze_cache_key() {
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    let conv_id = "eeeeeeee-1111-2222-3333-444444444444";
+    let logs = app
+        .join("brain")
+        .join(conv_id)
+        .join(".system_generated")
+        .join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::create_dir_all(app.join("conversations")).unwrap();
+    std::fs::write(
+        logs.join("transcript_full.jsonl"),
+        "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"hello\"}\n",
+    )
+    .unwrap();
+
+    // Populate conversation DB with claude-opus-4-6 + 320k limit, then hold an exclusive lock
+    let db_path = app.join("conversations").join(format!("{conv_id}.db"));
+    let lock_conn = Connection::open(&db_path).unwrap();
+    lock_conn
+        .execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);
+             CREATE TABLE executor_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .unwrap();
+    let mut step_model = Vec::new();
+    encode_varint_field(1, 1026, &mut step_model);
+    let mut step_meta = Vec::new();
+    encode_bytes_field(24, &step_model, &mut step_meta);
+    lock_conn
+        .execute(
+            "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+            [&step_meta],
+        )
+        .unwrap();
+    let mut cp = Vec::new();
+    encode_varint_field(5, 320_000, &mut cp);
+    let mut cc = Vec::new();
+    encode_bytes_field(2, &cp, &mut cc);
+    let mut exec_root = Vec::new();
+    encode_bytes_field(10, &cc, &mut exec_root);
+    lock_conn
+        .execute(
+            "INSERT INTO executor_metadata (idx, data) VALUES (1, ?1)",
+            [&exec_root],
+        )
+        .unwrap();
+
+    lock_conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+    let mut cfg = MonitorConfig::new(GeminiPaths::from_gemini_dir(&gemini));
+    cfg.poll_interval = Duration::from_millis(50);
+    let handle = MonitorHandle::start(cfg);
+
+    // Wait for first poll (which hits db_busy)
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while handle.snapshot().last_updated_at.is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let snap_busy = handle.snapshot();
+    assert!(snap_busy.db_busy);
+
+    // Release exclusive lock without changing DB file mtime/size (ROLLBACK)
+    lock_conn.execute_batch("ROLLBACK;").unwrap();
+    drop(lock_conn);
+
+    // Monitor must NOT have frozen the cache key while db_busy was true;
+    // subsequent poll should re-analyze and resolve the 320k limit and model.
+    let deadline2 = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline2 {
+        let s = handle.snapshot();
+        if !s.db_busy
+            && s.analysis
+                .as_ref()
+                .is_some_and(|a| a.context_limit == 320_000)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let snap_ok = handle.snapshot();
+    assert!(!snap_ok.db_busy);
+    let analysis = snap_ok.analysis.expect("analysis should exist");
+    assert_eq!(analysis.context_limit, 320_000);
+    assert_eq!(analysis.model.model_id, "claude-opus-4-6");
 }
 
 #[test]

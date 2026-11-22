@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use agy_core::analyzer::ConversationAnalysis;
 use agy_core::monitor::{MonitorCommand, MonitorConfig, MonitorHandle, MonitorSnapshot};
@@ -8,7 +8,7 @@ use agy_core::paths::GeminiPaths;
 use agy_core::sessions::SessionSummary;
 use chrono::{DateTime, Local, TimeZone, Utc};
 use eframe::egui;
-use egui_plot::{Corner, HLine, Legend, Line, Plot, PlotPoints, VLine};
+use egui_plot::{Corner, HLine, Legend, Line, Plot, PlotPoints, Points, VLine};
 
 use crate::fonts::install_japanese_fonts;
 use crate::theme::{Palette, ThemeMode, apply_theme};
@@ -111,16 +111,22 @@ impl AgyMonitorApp {
 
 impl eframe::App for AgyMonitorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
         let snap = self.monitor.snapshot();
+        self.render_ui(ui, &snap);
+    }
+}
+
+impl AgyMonitorApp {
+    fn render_ui(&mut self, ui: &mut egui::Ui, snap: &MonitorSnapshot) {
+        let ctx = ui.ctx().clone();
         let palette = Palette::for_mode(self.theme_mode);
 
         if self.compact_mode {
-            self.render_compact_hud(ui, &ctx, &snap, &palette);
+            self.render_compact_hud(ui, &ctx, snap, &palette);
             return;
         }
 
-        self.render_top_bar(ui, &ctx, &snap, &palette);
+        self.render_top_bar(ui, &ctx, snap, &palette);
 
         match self.main_tab {
             MainTab::UsagePhase2 => {
@@ -137,14 +143,12 @@ impl eframe::App for AgyMonitorApp {
                 });
             }
             MainTab::Realtime => {
-                self.render_sidebar(ui, &snap, &palette);
-                self.render_main_pane(ui, &ctx, &snap, &palette);
+                self.render_sidebar(ui, snap, &palette);
+                self.render_main_pane(ui, &ctx, snap, &palette);
             }
         }
     }
-}
 
-impl AgyMonitorApp {
     fn render_top_bar(
         &mut self,
         ui: &mut egui::Ui,
@@ -231,6 +235,17 @@ impl AgyMonitorApp {
             .max_size(460.0)
             .show(ui, |ui| {
                 ui.add_space(4.0);
+
+                // Clear stale project filter if that project disappeared on reload.
+                if !self.project_filter.is_empty()
+                    && !snap
+                        .index
+                        .projects
+                        .iter()
+                        .any(|p| p.key == self.project_filter)
+                {
+                    self.project_filter.clear();
+                }
 
                 // Project filter
                 let selected_proj_label = if self.project_filter.is_empty() {
@@ -455,7 +470,8 @@ impl AgyMonitorApp {
             };
             if ui.small_button(copy_lbl).clicked() {
                 ctx.copy_text(analysis.conversation_id.clone());
-                self.copied_until = Some(Instant::now() + std::time::Duration::from_secs(2));
+                self.copied_until = Some(Instant::now() + Duration::from_secs(2));
+                ctx.request_repaint_after(Duration::from_secs(2));
             }
 
             let badge_text = if analysis.exact { "実測" } else { "推定" };
@@ -498,12 +514,11 @@ impl AgyMonitorApp {
         palette: &Palette,
     ) {
         let avail = ui.available_width();
-        let cols = 4;
         let spacing = 8.0;
-        let card_w = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(140.0);
+        let cols = if avail >= 580.0 { 4 } else { 2 };
+        let card_w = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(120.0);
 
-        ui.horizontal(|ui| {
-            // Card 1: Context usage
+        let render_card_1 = |ui: &mut egui::Ui| {
             kpi_frame(ui, card_w, palette, |ui| {
                 ui.label(
                     egui::RichText::new("コンテキスト使用率")
@@ -528,8 +543,9 @@ impl AgyMonitorApp {
                     .color(palette.text_muted),
                 );
             });
+        };
 
-            // Card 2: Latest cache hit ratio
+        let render_card_2 = |ui: &mut egui::Ui| {
             kpi_frame(ui, card_w, palette, |ui| {
                 ui.label(
                     egui::RichText::new("直近キャッシュ率")
@@ -553,8 +569,9 @@ impl AgyMonitorApp {
                     .color(palette.text_muted),
                 );
             });
+        };
 
-            // Card 3: Cumulative cache hit ratio
+        let render_card_3 = |ui: &mut egui::Ui| {
             kpi_frame(ui, card_w, palette, |ui| {
                 ui.label(
                     egui::RichText::new("累計キャッシュ率")
@@ -578,8 +595,9 @@ impl AgyMonitorApp {
                     .color(palette.text_muted),
                 );
             });
+        };
 
-            // Card 4: Compactions
+        let render_card_4 = |ui: &mut egui::Ui| {
             kpi_frame(ui, card_w, palette, |ui| {
                 ui.label(
                     egui::RichText::new("コンパクション")
@@ -602,7 +620,26 @@ impl AgyMonitorApp {
                     .color(palette.text_muted),
                 );
             });
-        });
+        };
+
+        if cols == 4 {
+            ui.horizontal(|ui| {
+                render_card_1(ui);
+                render_card_2(ui);
+                render_card_3(ui);
+                render_card_4(ui);
+            });
+        } else {
+            ui.horizontal(|ui| {
+                render_card_1(ui);
+                render_card_2(ui);
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                render_card_3(ui);
+                render_card_4(ui);
+            });
+        }
     }
 
     fn render_buckets_bar(
@@ -645,15 +682,16 @@ impl AgyMonitorApp {
                     if *val == 0 {
                         continue;
                     }
+                    let remain = (rect.right() - x).max(0.0);
                     let w = if idx == segments.len() - 1 {
-                        (rect.right() - x).max(0.0)
+                        remain
                     } else {
-                        (((*val as f64 / total as f64) * bar_w as f64) as f32).max(1.0)
+                        (((*val as f64 / total as f64) * bar_w as f64) as f32)
+                            .max(1.0)
+                            .min(remain)
                     };
-                    let seg_rect = egui::Rect::from_min_size(
-                        egui::pos2(x, rect.top()),
-                        egui::vec2(w.min(rect.right() - x), bar_h),
-                    );
+                    let seg_rect =
+                        egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, bar_h));
                     painter.rect_filled(seg_rect, 0.0, *color);
                     x += w;
                 }
@@ -680,14 +718,18 @@ impl AgyMonitorApp {
 
     fn render_plots(&self, ui: &mut egui::Ui, analysis: &ConversationAnalysis, palette: &Palette) {
         let avail = ui.available_width();
-        let half_w = ((avail - 10.0) / 2.0).max(260.0);
+        let side_by_side = avail >= 540.0;
+        let plot_w = if side_by_side {
+            ((avail - 10.0) / 2.0).max(240.0)
+        } else {
+            avail.max(200.0)
+        };
 
-        ui.horizontal(|ui| {
-            // Plot 1: Context progression + limit line + compaction vertical markers
+        let render_ctx_plot = |ui: &mut egui::Ui| {
             ui.vertical(|ui| {
-                ui.set_width(half_w);
+                ui.set_width(plot_w);
                 ui.label(egui::RichText::new("コンテキスト推移").strong());
-                let pts: PlotPoints<'_> = analysis
+                let raw_pts: Vec<[f64; 2]> = analysis
                     .turns_history
                     .iter()
                     .enumerate()
@@ -696,34 +738,44 @@ impl AgyMonitorApp {
 
                 Plot::new("ctx_history_plot")
                     .height(190.0)
-                    .width(half_w)
+                    .width(plot_w)
                     .include_y(0.0)
                     .include_y(analysis.context_limit as f64 * 1.05)
                     .legend(Legend::default().position(Corner::LeftTop))
                     .show(ui, |plot_ui| {
                         plot_ui.line(
-                            Line::new("コンテキスト量", pts)
+                            Line::new("コンテキスト量", PlotPoints::from(raw_pts.clone()))
                                 .color(palette.accent)
                                 .width(2.0),
                         );
+                        if !raw_pts.is_empty() {
+                            plot_ui.points(
+                                Points::new("", PlotPoints::from(raw_pts))
+                                    .color(palette.accent)
+                                    .radius(3.0),
+                            );
+                        }
                         plot_ui.hline(
                             HLine::new("上限", analysis.context_limit as f64).color(palette.danger),
                         );
+                        let mut legend_emitted = false;
                         for (idx, t) in analysis.turns_history.iter().enumerate() {
                             if t.compacted {
-                                plot_ui.vline(
-                                    VLine::new("圧縮", idx as f64 + 1.0).color(palette.warn),
-                                );
+                                let name = if legend_emitted { "" } else { "圧縮" };
+                                legend_emitted = true;
+                                plot_ui
+                                    .vline(VLine::new(name, idx as f64 + 1.0).color(palette.warn));
                             }
                         }
                     });
             });
+        };
 
-            // Plot 2: Cache hit ratio progression
+        let render_cache_plot = |ui: &mut egui::Ui| {
             ui.vertical(|ui| {
-                ui.set_width(half_w);
+                ui.set_width(plot_w);
                 ui.label(egui::RichText::new("キャッシュ率推移 (%)").strong());
-                let cache_pts: PlotPoints<'_> = analysis
+                let raw_cache_pts: Vec<[f64; 2]> = analysis
                     .turns_history
                     .iter()
                     .enumerate()
@@ -732,19 +784,37 @@ impl AgyMonitorApp {
 
                 Plot::new("cache_history_plot")
                     .height(190.0)
-                    .width(half_w)
+                    .width(plot_w)
                     .include_y(0.0)
                     .include_y(100.0)
                     .legend(Legend::default().position(Corner::LeftBottom))
                     .show(ui, |plot_ui| {
                         plot_ui.line(
-                            Line::new("キャッシュ率 %", cache_pts)
+                            Line::new("キャッシュ率 %", PlotPoints::from(raw_cache_pts.clone()))
                                 .color(palette.cache_line)
                                 .width(2.0),
                         );
+                        if !raw_cache_pts.is_empty() {
+                            plot_ui.points(
+                                Points::new("", PlotPoints::from(raw_cache_pts))
+                                    .color(palette.cache_line)
+                                    .radius(3.0),
+                            );
+                        }
                     });
             });
-        });
+        };
+
+        if side_by_side {
+            ui.horizontal(|ui| {
+                render_ctx_plot(ui);
+                render_cache_plot(ui);
+            });
+        } else {
+            render_ctx_plot(ui);
+            ui.add_space(8.0);
+            render_cache_plot(ui);
+        }
     }
 
     fn render_bottom_details(
@@ -852,24 +922,31 @@ impl AgyMonitorApp {
                 .unwrap_or("待機中");
 
             // Row 1: Title / Model / Always on Top / Normal mode
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(truncate_ui(title, 20)).strong());
-                if let Some(a) = &snap.analysis {
-                    ui.label(
-                        egui::RichText::new(truncate_ui(&a.model.model_label, 18))
-                            .small()
-                            .color(palette.accent),
-                    );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Right-side controls are placed via Sides::shrink_left so long titles never push buttons off-screen.
+            egui::Sides::new().shrink_left().show(
+                ui,
+                |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(title).strong()).truncate());
+                    if let Some(a) = &snap.analysis {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&a.model.model_label)
+                                    .small()
+                                    .color(palette.accent),
+                            )
+                            .truncate(),
+                        );
+                    }
+                },
+                |ui| {
                     if ui.small_button("通常").clicked() {
                         self.toggle_compact_mode(ctx);
                     }
                     if ui.selectable_label(self.always_on_top, "最前面").clicked() {
                         self.toggle_always_on_top(ctx);
                     }
-                });
-            });
+                },
+            );
 
             ui.add_space(6.0);
 
@@ -1021,4 +1098,294 @@ fn format_step_time(raw: Option<&str>) -> String {
         return local.format("%H:%M:%S").to_string();
     }
     "-".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agy_core::analyzer::{
+        CacheStats, CompactionEvent, ContextBuckets, HeavyToolCall, StepSummary, TurnPoint,
+    };
+    use agy_core::models::ModelInfo;
+    use agy_core::paths::Surface;
+    use agy_core::sessions::{ProjectInfo, SessionIndex, SessionTreeNode};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn sample_snapshot() -> MonitorSnapshot {
+        let conv_id = "11111111-2222-3333-4444-555555555555".to_string();
+        let sub_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string();
+        let root_sum = SessionSummary {
+            conversation_id: conv_id.clone(),
+            surface: Surface::App,
+            app_data_dir: PathBuf::from("."),
+            title: "非常に長い日本語の会話タイトルでコンパクト表示時の見切れを検証するテスト"
+                .to_string(),
+            preview: String::new(),
+            display_title:
+                "非常に長い日本語の会話タイトルでコンパクト表示時の見切れを検証するテスト"
+                    .to_string(),
+            agent_name: String::new(),
+            parent_conversation_id: String::new(),
+            root_session_id: conv_id.clone(),
+            root_title: "非常に長い日本語の会話タイトルでコンパクト表示時の見切れを検証するテスト"
+                .to_string(),
+            is_subagent: false,
+            nesting_depth: 0,
+            project_id: "p1".to_string(),
+            project_key: "p1".to_string(),
+            project_label: "agy-monitor".to_string(),
+            workspace_keys: vec![],
+            last_modified_ms: 1_700_000_000_000,
+            effective_mtime_ms: 1_700_000_000_000,
+            has_transcript: true,
+            has_db: true,
+        };
+        let sub_sum = SessionSummary {
+            conversation_id: sub_id.clone(),
+            display_title: "research".to_string(),
+            agent_name: "research".to_string(),
+            parent_conversation_id: conv_id.clone(),
+            is_subagent: true,
+            nesting_depth: 1,
+            ..root_sum.clone()
+        };
+
+        let mut by_id = std::collections::HashMap::new();
+        by_id.insert(conv_id.clone(), root_sum.clone());
+        by_id.insert(sub_id.clone(), sub_sum.clone());
+
+        let index = SessionIndex {
+            projects: vec![ProjectInfo {
+                key: "p1".to_string(),
+                label: "agy-monitor".to_string(),
+            }],
+            roots: vec![SessionTreeNode {
+                summary: root_sum,
+                children: vec![sub_sum],
+            }],
+            by_id,
+            db_busy: false,
+        };
+
+        let analysis = ConversationAnalysis {
+            conversation_id: conv_id.clone(),
+            found: true,
+            exact: true,
+            model: ModelInfo {
+                model_id: "claude-opus-4-6".to_string(),
+                model_label: "Claude Opus 4.6 (High)".to_string(),
+                context_limit: 256_000,
+                model_max_tokens: 1_000_000,
+                limit_source: "antigravity-default".to_string(),
+            },
+            context_limit: 256_000,
+            used_tokens: 192_000,
+            free_tokens: 64_000,
+            used_percent: 75.0,
+            step_count: 4,
+            planner_turn_count: 3,
+            last_step_at: Some("2026-11-22T15:00:00Z".to_string()),
+            cache: CacheStats {
+                last_prompt_tokens: 190_000,
+                since_last_cache_tokens: 10_000,
+                cached_tokens: 180_000,
+                cache_hit_ratio: 94.7,
+                last_output_tokens: 2_000,
+                cumulative_input_tokens: 400_000,
+                cumulative_cached_tokens: 360_000,
+                session_cache_hit_ratio: 90.0,
+                cumulative_output_tokens: 5_000,
+            },
+            compactions: vec![
+                CompactionEvent {
+                    step_index: 2,
+                    before_tokens: 120_000,
+                    after_tokens: Some(40_000),
+                    saved_tokens: 80_000,
+                    summary_tokens: 1_200,
+                    created_at: None,
+                    is_explicit: true,
+                },
+                CompactionEvent {
+                    step_index: 5,
+                    before_tokens: 150_000,
+                    after_tokens: Some(50_000),
+                    saved_tokens: 100_000,
+                    summary_tokens: 0,
+                    created_at: None,
+                    is_explicit: false,
+                },
+            ],
+            total_saved_tokens: 180_000,
+            buckets: ContextBuckets {
+                user_messages: 10_000,
+                agent_replies: 20_000,
+                agent_thinking: 15_000,
+                tool_call_args: 5_000,
+                tool_call_outputs: 100_000,
+                system_tools: 4_800,
+                system_prompt: 30_000,
+                system_messages: 2_200,
+                checkpoint_buffer: 5_000,
+                free_space: 64_000,
+                customization_breakdown: None,
+            },
+            turns_history: vec![
+                TurnPoint {
+                    step_index: 1,
+                    prompt_tokens: 120_000,
+                    uncached_tokens: 20_000,
+                    cached_tokens: 100_000,
+                    output_tokens: 1_000,
+                    created_at: None,
+                    compacted: false,
+                },
+                TurnPoint {
+                    step_index: 3,
+                    prompt_tokens: 40_000,
+                    uncached_tokens: 5_000,
+                    cached_tokens: 35_000,
+                    output_tokens: 1_000,
+                    created_at: None,
+                    compacted: true,
+                },
+                TurnPoint {
+                    step_index: 6,
+                    prompt_tokens: 190_000,
+                    uncached_tokens: 10_000,
+                    cached_tokens: 180_000,
+                    output_tokens: 2_000,
+                    created_at: None,
+                    compacted: true,
+                },
+            ],
+            heavy_tool_calls: vec![HeavyToolCall {
+                step_index: 1,
+                tool_name: "read_file".to_string(),
+                label: "read_file (app.rs)".to_string(),
+                target_path: Some("C:\\repo\\app.rs".to_string()),
+                tokens: 50_000,
+            }],
+            total_tool_calls: 1,
+            step_summaries: vec![StepSummary {
+                step_index: 0,
+                step_type: "USER_INPUT".to_string(),
+                source: "USER".to_string(),
+                status: "DONE".to_string(),
+                created_at: Some("2026-11-22T15:00:00Z".to_string()),
+                prompt_tokens: 190_000,
+                cached_tokens: 180_000,
+                output_tokens: 2_000,
+                est_tokens: 100,
+                summary: "テスト実行".to_string(),
+            }],
+            spawned_subagents: vec![],
+            db_busy: false,
+        };
+
+        MonitorSnapshot {
+            index,
+            selected_id: Some(conv_id),
+            analysis: Some(analysis),
+            follow_latest: true,
+            paused: false,
+            last_updated_at: Some(Utc::now()),
+            last_error: None,
+            db_busy: false,
+            analysis_count: 1,
+        }
+    }
+
+    fn make_test_app() -> (TempDir, AgyMonitorApp) {
+        let tmp = TempDir::new().unwrap();
+        let paths = GeminiPaths::from_gemini_dir(tmp.path());
+        let mut config = MonitorConfig::new(paths);
+        config.poll_interval = Duration::from_secs(60);
+        let monitor = MonitorHandle::start(config);
+        let app = AgyMonitorApp {
+            monitor,
+            main_tab: MainTab::Realtime,
+            detail_tab: DetailTab::Steps,
+            theme_mode: ThemeMode::Dark,
+            always_on_top: false,
+            compact_mode: false,
+            saved_normal_size: DEFAULT_NORMAL_SIZE,
+            project_filter: String::new(),
+            search_query: String::new(),
+            expanded_roots: HashSet::new(),
+            copied_until: None,
+        };
+        (tmp, app)
+    }
+
+    #[test]
+    fn gui_02_compact_hud_keeps_controls_within_380px() {
+        let (_tmp, mut app) = make_test_app();
+        app.compact_mode = true;
+        let snap = sample_snapshot();
+        let ctx = egui::Context::default();
+        install_japanese_fonts(&ctx);
+
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, COMPACT_SIZE)),
+            ..Default::default()
+        };
+
+        let mut used_rect = egui::Rect::NOTHING;
+        let mut output = ctx.run_ui(raw_input, |ui| {
+            app.render_ui(ui, &snap);
+            used_rect = ui.min_rect();
+        });
+        let shapes_len = output.shapes.len();
+        output.textures_delta.clear();
+
+        assert!(
+            used_rect.right() <= COMPACT_SIZE.x + 1.0,
+            "compact HUD overflowed horizontally: right={} > {}",
+            used_rect.right(),
+            COMPACT_SIZE.x
+        );
+        assert!(
+            used_rect.bottom() <= COMPACT_SIZE.y + 1.0,
+            "compact HUD overflowed vertically: bottom={} > {}",
+            used_rect.bottom(),
+            COMPACT_SIZE.y
+        );
+        assert!(shapes_len > 0);
+    }
+
+    #[test]
+    fn gui_03_normal_narrow_and_tabs_render_cleanly() {
+        let (_tmp, mut app) = make_test_app();
+        let snap = sample_snapshot();
+        let ctx = egui::Context::default();
+        install_japanese_fonts(&ctx);
+
+        // Render at minimum window size (760x520) across tabs & themes
+        for (tab, detail, theme) in [
+            (MainTab::Realtime, DetailTab::Steps, ThemeMode::Dark),
+            (MainTab::Realtime, DetailTab::HeavyTools, ThemeMode::Light),
+            (MainTab::UsagePhase2, DetailTab::Steps, ThemeMode::Dark),
+        ] {
+            app.main_tab = tab;
+            app.detail_tab = detail;
+            app.theme_mode = theme;
+            apply_theme(&ctx, theme);
+
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(760.0, 520.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw_input, |ui| {
+                app.render_ui(ui, &snap);
+            });
+            let shapes_len = output.shapes.len();
+            output.textures_delta.clear();
+            assert!(shapes_len > 0);
+        }
+    }
 }

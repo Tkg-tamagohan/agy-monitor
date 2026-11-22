@@ -128,8 +128,13 @@ pub fn normalize_file_uri(raw: &str) -> Option<PathBuf> {
             return Some(path_buf);
         }
 
-        // Manual fallback for `file://C:/foo`, `file:///C:\foo`, or Unix paths when running on Windows.
+        // Manual fallback for `file://C:/foo`, `file:///C:\foo`, `file://localhost/C:\foo`, or Unix paths when running on Windows.
         let rest = &replaced[7..];
+        let rest = if rest.len() >= 10 && rest[..10].eq_ignore_ascii_case("localhost/") {
+            &rest[10..]
+        } else {
+            rest
+        };
         let decoded = percent_decode_utf8(rest);
         let candidate = if let Some(after_slash) = decoded.strip_prefix('/') {
             if is_windows_drive_prefix(after_slash) {

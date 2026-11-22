@@ -886,16 +886,23 @@ pub fn analyze_conversation(
     })
 }
 
+fn read_file_utf8_lossy(path: &Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
 fn load_combined_steps(
     full_path: &Path,
     compact_path: &Path,
     tfp: &TranscriptFingerprint,
 ) -> Vec<TranscriptStep> {
     if tfp.full.exists {
-        let full_raw = std::fs::read_to_string(full_path).unwrap_or_default();
+        let full_raw = read_file_utf8_lossy(full_path);
         let mut steps = parse_transcript_steps(&full_raw);
         if tfp.compact.exists && tfp.compact.mtime_ns > tfp.full.mtime_ns {
-            let compact_raw = std::fs::read_to_string(compact_path).unwrap_or_default();
+            let compact_raw = read_file_utf8_lossy(compact_path);
             let compact_steps = parse_transcript_steps(&compact_raw);
             if compact_steps.len() > steps.len() {
                 steps.extend_from_slice(&compact_steps[steps.len()..]);
@@ -903,7 +910,7 @@ fn load_combined_steps(
         }
         steps
     } else if tfp.compact.exists {
-        let compact_raw = std::fs::read_to_string(compact_path).unwrap_or_default();
+        let compact_raw = read_file_utf8_lossy(compact_path);
         parse_transcript_steps(&compact_raw)
     } else {
         Vec::new()
