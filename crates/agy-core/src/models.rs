@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::CoreError;
 use crate::fingerprint::wal_path_for;
 use crate::proto::{decode_fields, proto_bytes, proto_nested, proto_num, proto_text};
-use crate::sqlite::with_readonly_retry;
+use crate::sqlite::{with_readonly_retry, with_readonly_retry_schedule};
 
 pub const DEFAULT_CONTEXT_LIMIT: u64 = 1_048_576;
 
@@ -78,6 +78,7 @@ pub struct ModelInfo {
 pub struct ModelDetectionResult {
     pub info: ModelInfo,
     pub db_busy: bool,
+    pub model_from_db: bool,
 }
 
 pub fn normalize_model_slug(raw_name: &str) -> String {
@@ -279,6 +280,33 @@ fn title_word(w: &str) -> String {
     }
 }
 
+pub fn format_model_short_label(label: &str) -> String {
+    let trimmed = label.trim();
+    if trimmed.is_empty() || trimmed == "Default model" {
+        return String::new();
+    }
+    let mut s = match trimmed {
+        "Orchestrator (Carbon)" => return "Orch (Carbon)".to_string(),
+        "Orchestrator (Argon)" => return "Orch (Argon)".to_string(),
+        "Gemini Flash Worker" => return "Flash Worker".to_string(),
+        _ => trimmed.to_string(),
+    };
+    for (full, short) in [
+        (" (Extra Low)", " (XL)"),
+        (" (Xhigh)", " (XH)"),
+        (" (High)", " (H)"),
+        (" (Medium)", " (M)"),
+        (" (Low)", " (L)"),
+        (" (Tiered)", " (T)"),
+    ] {
+        if let Some(prefix) = s.strip_suffix(full) {
+            s = format!("{prefix}{short}");
+            break;
+        }
+    }
+    s
+}
+
 pub fn map_placeholder_enum_to_slug(enum_name: &str) -> String {
     match enum_name.trim() {
         "" => String::new(),
@@ -425,36 +453,34 @@ pub fn extract_entry_model_slug(bytes: &[u8], is_step: bool) -> String {
         .unwrap_or_default()
 }
 
-pub fn detect_conversation_model(
-    app_data: &Path,
-    conv_id: &str,
-    pbtxt_override: Option<&Path>,
-) -> ModelDetectionResult {
-    let db_path = app_data.join("conversations").join(format!("{conv_id}.db"));
-    let pbtxt_path = pbtxt_override
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| app_data.join("antigravity_state.pbtxt"));
-
+fn read_db_model_slugs(
+    db_path: &Path,
+    steps_limit: usize,
+    gen_limit: usize,
+    read_executor: bool,
+    retry_on_busy: bool,
+) -> (Vec<String>, u64, bool) {
     let mut found_slugs: Vec<String> = Vec::new();
     let mut agy_max_token_limit: u64 = 0;
     let mut db_busy = false;
 
-    let db_ready = std::fs::metadata(&db_path)
-        .map(|m| m.is_file() && (m.len() > 0 || wal_path_for(&db_path).exists()))
+    let db_ready = std::fs::metadata(db_path)
+        .map(|m| m.is_file() && (m.len() > 0 || wal_path_for(db_path).exists()))
         .unwrap_or(false);
 
     if db_ready {
-        let res = with_readonly_retry(&db_path, |conn| {
+        let query_fn = |conn: &rusqlite::Connection| {
             let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
             let tables: std::collections::HashSet<String> = stmt
                 .query_map([], |row| row.get::<_, String>(0))?
                 .filter_map(|r| r.ok())
                 .collect();
 
-            if tables.contains("steps") {
-                let mut s_stmt = conn.prepare(
-                    "SELECT metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx DESC LIMIT 8",
-                )?;
+            if steps_limit > 0 && tables.contains("steps") {
+                let sql = format!(
+                    "SELECT metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx DESC LIMIT {steps_limit}"
+                );
+                let mut s_stmt = conn.prepare(&sql)?;
                 let mut rows = s_stmt.query([])?;
                 while let Some(row) = rows.next()? {
                     if let Ok(bytes) = row.get::<_, Vec<u8>>(0) {
@@ -466,9 +492,10 @@ pub fn detect_conversation_model(
                 }
             }
 
-            if tables.contains("gen_metadata") {
-                let mut g_stmt =
-                    conn.prepare("SELECT data FROM gen_metadata ORDER BY rowid DESC LIMIT 5")?;
+            if gen_limit > 0 && tables.contains("gen_metadata") {
+                let sql =
+                    format!("SELECT data FROM gen_metadata ORDER BY rowid DESC LIMIT {gen_limit}");
+                let mut g_stmt = conn.prepare(&sql)?;
                 let mut rows = g_stmt.query([])?;
                 while let Some(row) = rows.next()? {
                     if let Ok(bytes) = row.get::<_, Vec<u8>>(0) {
@@ -480,7 +507,7 @@ pub fn detect_conversation_model(
                 }
             }
 
-            if tables.contains("executor_metadata") {
+            if read_executor && tables.contains("executor_metadata") {
                 let mut e_stmt =
                     conn.prepare("SELECT data FROM executor_metadata ORDER BY rowid DESC LIMIT 1")?;
                 let mut rows = e_stmt.query([])?;
@@ -498,7 +525,13 @@ pub fn detect_conversation_model(
             }
 
             Ok(())
-        });
+        };
+
+        let res = if retry_on_busy {
+            with_readonly_retry(db_path, query_fn)
+        } else {
+            with_readonly_retry_schedule(db_path, &[], query_fn)
+        };
 
         if let Err(err) = res
             && matches!(err, CoreError::DbBusy { .. })
@@ -507,13 +540,50 @@ pub fn detect_conversation_model(
         }
     }
 
-    let mut selected_slug = found_slugs
+    (found_slugs, agy_max_token_limit, db_busy)
+}
+
+fn pick_selected_slug(found_slugs: &[String]) -> String {
+    found_slugs
         .iter()
         .find(|s| is_concrete_model_slug(s) && s.as_str() != "gemini-flash-worker-agy")
         .or_else(|| found_slugs.iter().find(|s| is_concrete_model_slug(s)))
         .or_else(|| found_slugs.first())
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// Lightweight model label lookup for session lists.
+/// Scans only recent `steps` and `gen_metadata` in `conversations/<conv_id>.db` without
+/// falling back to `executor_metadata` or `antigravity_state.pbtxt`.
+pub fn detect_conversation_model_label_from_db(
+    app_data: &Path,
+    conv_id: &str,
+) -> (Option<String>, bool) {
+    let db_path = app_data.join("conversations").join(format!("{conv_id}.db"));
+    let (found_slugs, _, db_busy) = read_db_model_slugs(&db_path, 4, 3, false, false);
+    let selected_slug = pick_selected_slug(&found_slugs);
+    if selected_slug.is_empty() {
+        (None, db_busy)
+    } else {
+        (Some(format_model_label(&selected_slug)), db_busy)
+    }
+}
+
+pub fn detect_conversation_model(
+    app_data: &Path,
+    conv_id: &str,
+    pbtxt_override: Option<&Path>,
+) -> ModelDetectionResult {
+    let db_path = app_data.join("conversations").join(format!("{conv_id}.db"));
+    let pbtxt_path = pbtxt_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| app_data.join("antigravity_state.pbtxt"));
+
+    let (found_slugs, agy_max_token_limit, db_busy) =
+        read_db_model_slugs(&db_path, 8, 5, true, true);
+    let mut selected_slug = pick_selected_slug(&found_slugs);
+    let model_from_db = !selected_slug.is_empty();
 
     if selected_slug.is_empty()
         && let Ok(pbtxt) = std::fs::read_to_string(&pbtxt_path)
@@ -525,6 +595,7 @@ pub fn detect_conversation_model(
     ModelDetectionResult {
         info: resolve_model_context_limit(&selected_slug, agy_max_token_limit),
         db_busy,
+        model_from_db,
     }
 }
 

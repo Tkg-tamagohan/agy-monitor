@@ -38,6 +38,7 @@ pub struct SessionSummary {
     pub effective_mtime_ms: i64,
     pub has_transcript: bool,
     pub has_db: bool,
+    pub model_label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -355,6 +356,7 @@ pub fn load_session_index(paths: &GeminiPaths) -> SessionIndex {
                 effective_mtime_ms,
                 has_transcript,
                 has_db,
+                model_label: String::new(),
             },
         );
     }
