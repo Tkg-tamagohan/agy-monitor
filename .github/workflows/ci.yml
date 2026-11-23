@@ -1,0 +1,225 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: detect
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          DOC_ONLY_RE = re.compile(r"^(AGENTS\.md|README\.md|LICENSE(?:\.[^/]+)?|docs/.*\.md)$")
+
+          def emit(val: bool) -> None:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write(f"rust={'true' if val else 'false'}\n")
+              print(f"rust={'true' if val else 'false'}")
+              sys.exit(0)
+
+          event = os.environ.get("EVENT_NAME", "")
+          if event == "workflow_dispatch":
+              emit(True)
+
+          if event == "pull_request":
+              base = os.environ.get("PR_BASE", "")
+              head = os.environ.get("PR_HEAD", "")
+              cmd = ["git", "diff", "--no-renames", "-z", "--name-only", f"{base}...{head}"]
+          elif event == "push":
+              base = os.environ.get("PUSH_BEFORE", "")
+              head = os.environ.get("PUSH_HEAD", "")
+              if not base or set(base) == {"0"} or not head:
+                  emit(True)
+              cmd = ["git", "diff", "--no-renames", "-z", "--name-only", base, head]
+          else:
+              emit(True)
+
+          proc = subprocess.run(cmd, capture_output=True)
+          if proc.returncode != 0:
+              print("git diff failed; falling back to rust=true", file=sys.stderr)
+              emit(True)
+
+          files = [p.decode("utf-8", errors="surrogateescape") for p in proc.stdout.split(b"\x00") if p]
+          if not files:
+              print("no changed files detected; falling back to rust=true")
+              emit(True)
+
+          needs_rust = any(not DOC_ONLY_RE.match(p) for p in files)
+          print("changed files:", files)
+          emit(needs_rust)
+          PY
+
+  hygiene:
+    name: Text hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check UTF-8, replacement chars, and conflict markers
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          CONFLICT_EDGE_RE = re.compile(r"^(<<<<<<<|>>>>>>>)")
+          CONFLICT_DIVIDER_RE = re.compile(r"^=======$")
+          BINARY_EXTS = {
+              ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp",
+              ".zip", ".gz", ".tar", ".7z", ".exe", ".dll", ".so", ".dylib",
+              ".bin", ".woff", ".woff2", ".ttf", ".ttc", ".otf",
+          }
+          STRICT_TEXT_EXTS = {
+              ".rs", ".toml", ".md", ".yml", ".yaml", ".json", ".txt", ".py", ".sh", ".ps1", ".lock", ".html", ".htm"
+          }
+          STRICT_TEXT_NAMES = {
+              "license",
+              ".gitignore",
+              ".gitattributes",
+              ".editorconfig",
+          }
+
+          def is_strict_text(p: pathlib.Path) -> bool:
+              name = p.name.lower()
+              suffix = p.suffix.lower()
+              if suffix in BINARY_EXTS:
+                  return False
+              return (
+                  suffix in STRICT_TEXT_EXTS
+                  or name in STRICT_TEXT_NAMES
+                  or name.startswith("license.")
+                  or name.startswith("license-")
+              )
+
+          proc = subprocess.run(["git", "ls-files", "-z"], capture_output=True, check=True)
+          paths = [p.decode("utf-8") for p in proc.stdout.split(b"\x00") if p]
+
+          errors: list[str] = []
+          for rel in paths:
+              p = pathlib.Path(rel)
+              if not p.is_file():
+                  continue
+              raw = p.read_bytes()
+              if b"\x00" in raw:
+                  if is_strict_text(p):
+                      errors.append(f"{rel}: NUL byte in text file")
+                  continue
+              try:
+                  text = raw.decode("utf-8")
+              except UnicodeDecodeError as exc:
+                  if is_strict_text(p):
+                      errors.append(f"{rel}: invalid UTF-8 ({exc})")
+                  continue
+              is_md = p.suffix.lower() == ".md"
+              for idx, line in enumerate(text.splitlines(), start=1):
+                  if "\ufffd" in line:
+                      errors.append(f"{rel}:{idx}: contains U+FFFD replacement char")
+                  if CONFLICT_EDGE_RE.match(line) or (not is_md and CONFLICT_DIVIDER_RE.match(line)):
+                      errors.append(f"{rel}:{idx}: contains merge conflict marker")
+
+          if errors:
+              for e in errors:
+                  print(e, file=sys.stderr)
+              sys.exit(1)
+          print(f"Checked {len(paths)} tracked files cleanly.")
+          PY
+
+  rust-windows:
+    name: Rust (Windows)
+    needs: [changes]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        shell: pwsh
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        shell: pwsh
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        shell: pwsh
+        run: cargo test --workspace --locked
+
+  ci:
+    name: CI
+    needs: [changes, hygiene, rust-windows]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify required job results
+        shell: bash
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          RUN_RUST: ${{ needs.changes.outputs.rust }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          run_rust = os.environ.get("RUN_RUST", "")
+          expected = {
+              "changes": "success",
+              "hygiene": "success",
+              "rust-windows": "success" if run_rust == "true" else "skipped",
+          }
+
+          failed = False
+          for job, exp in expected.items():
+              actual = needs.get(job, {}).get("result")
+              print(f"{job}: actual={actual} expected={exp}")
+              if actual != exp:
+                  failed = True
+
+          if failed:
+              sys.exit(1)
+          PY
