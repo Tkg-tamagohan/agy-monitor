@@ -100,7 +100,6 @@ jobs:
 
           CONFLICT_EDGE_RE = re.compile(r"^(<<<<<<<|>>>>>>>)")
           CONFLICT_DIVIDER_RE = re.compile(r"^=======$")
-          FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
           BINARY_EXTS = {
               ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp",
               ".zip", ".gz", ".tar", ".7z", ".exe", ".dll", ".so", ".dylib",
@@ -148,41 +147,11 @@ jobs:
                       errors.append(f"{rel}: invalid UTF-8 ({exc})")
                   continue
               is_md = p.suffix.lower() == ".md"
-              lines = text.splitlines()
-              fence_char = None
-              fence_len = 0
-              prev_was_fence = False
-              for idx, line in enumerate(lines, start=1):
-                  is_fence_line = False
-                  if is_md:
-                      if fence_char is None:
-                          m = FENCE_OPEN_RE.match(line)
-                          if m and (m.group(1)[0] == "~" or "`" not in m.group(2)):
-                              fence_char, fence_len = m.group(1)[0], len(m.group(1))
-                              is_fence_line = True
-                      else:
-                          if re.match(rf"^[ ]{{0,3}}{re.escape(fence_char)}{{{fence_len},}}[ \t]*$", line):
-                              fence_char, fence_len = None, 0
-                              is_fence_line = True
-
+              for idx, line in enumerate(text.splitlines(), start=1):
                   if "\ufffd" in line:
                       errors.append(f"{rel}:{idx}: contains U+FFFD replacement char")
-                  if CONFLICT_EDGE_RE.match(line):
+                  if CONFLICT_EDGE_RE.match(line) or (not is_md and CONFLICT_DIVIDER_RE.match(line)):
                       errors.append(f"{rel}:{idx}: contains merge conflict marker")
-                  elif CONFLICT_DIVIDER_RE.match(line):
-                      in_fence = is_md and fence_char is not None and not is_fence_line
-                      is_setext_heading = (
-                          is_md
-                          and not in_fence
-                          and not prev_was_fence
-                          and idx >= 2
-                          and bool(lines[idx - 2].strip())
-                          and not CONFLICT_EDGE_RE.match(lines[idx - 2])
-                          and not CONFLICT_DIVIDER_RE.match(lines[idx - 2])
-                      )
-                      if not (in_fence or is_setext_heading):
-                          errors.append(f"{rel}:{idx}: contains merge conflict marker")
-                  prev_was_fence = is_fence_line
 
           if errors:
               for e in errors:
