@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod customizations;
 pub mod fingerprint;
 pub mod models;
 pub mod monitor;
@@ -6,6 +7,7 @@ pub mod paths;
 pub mod proto;
 pub mod sessions;
 pub mod sqlite;
+pub mod usage;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {

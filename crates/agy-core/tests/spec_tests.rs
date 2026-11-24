@@ -507,7 +507,7 @@ fn ctx_01_transcript_merge_torn_line_utf8_and_bucket_reconcile() {
     assert!(res.exact);
     assert_eq!(res.step_count, 4);
     assert_eq!(res.planner_turn_count, 2);
-    assert!(res.buckets.customization_breakdown.is_none());
+    assert!(res.buckets.customization_breakdown.is_some());
     // exact target = last_prompt (10600) + last_out (300) = 10900
     assert_eq!(res.used_tokens, 10_900);
     assert_eq!(res.buckets.active_total(), 10_900);
@@ -1889,5 +1889,173 @@ fn sess_03_summaries_db_recovers_when_lock_released_within_retry_window() {
     assert_eq!(
         index.by_id.get(conv_id).map(|s| s.display_title.as_str()),
         Some("Recovered Summary")
+    );
+}
+
+#[test]
+fn ctx_04_customization_breakdown_populates_and_reconciles_exact_total() {
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    let conv_id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    let logs = app
+        .join("brain")
+        .join(conv_id)
+        .join(".system_generated")
+        .join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+
+    // Create mock MCP instructions and always-on rules exceeding exact_target (1500)
+    let mcp_dir = gemini.join("antigravity").join("mcp").join("demo-mcp");
+    std::fs::create_dir_all(&mcp_dir).unwrap();
+    let long_instructions = "instruction ".repeat(800);
+    std::fs::write(mcp_dir.join("instructions.md"), long_instructions).unwrap();
+
+    let rules_dir = gemini
+        .join("config")
+        .join("plugins")
+        .join("demo-plugin")
+        .join("rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    let long_rules = "rule ".repeat(800);
+    std::fs::write(rules_dir.join("always.md"), long_rules).unwrap();
+
+    let compact_lines = [
+        r#"{"step_index":0,"type":"USER_INPUT","content":"hello"}"#,
+        r#"{"step_index":1,"type":"PLANNER_RESPONSE","input_tokens":500,"cache_read_tokens":800,"output_tokens":200,"content":"ok"}"#,
+    ]
+    .join("\n")
+        + "\n";
+    std::fs::write(logs.join("transcript.jsonl"), compact_lines).unwrap();
+
+    let res = analyze_conversation(&app, conv_id, None, None).unwrap();
+    assert!(res.found);
+    assert!(res.exact);
+    assert!(res.buckets.customization_breakdown.is_some());
+    assert_eq!(res.used_tokens, 1500);
+    assert_eq!(res.buckets.active_total(), 1500);
+
+    // When exact_target is large enough, customization breakdown values are preserved non-zero
+    let large_lines = [
+        r#"{"step_index":0,"type":"USER_INPUT","content":"hello"}"#,
+        r#"{"step_index":1,"type":"PLANNER_RESPONSE","input_tokens":50000,"cache_read_tokens":10000,"output_tokens":500,"content":"ok"}"#,
+    ]
+    .join("\n")
+        + "\n";
+    std::fs::write(logs.join("transcript.jsonl"), large_lines).unwrap();
+    let res_large = analyze_conversation(&app, conv_id, None, None).unwrap();
+    let bd = res_large
+        .buckets
+        .customization_breakdown
+        .as_ref()
+        .expect("customization_breakdown should be populated");
+    assert!(bd.mcp_instructions > 0);
+    assert!(bd.rules_files > 0);
+    assert_eq!(res_large.used_tokens, 60_500);
+    assert_eq!(res_large.buckets.active_total(), 60_500);
+}
+
+#[test]
+fn mon_07_async_usage_and_customizations_refresh_and_drop_join() {
+    use agy_core::monitor::{MonitorCommand, MonitorConfig, MonitorHandle};
+    use agy_core::usage::UsagePeriod;
+
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    let conv_id = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    let logs = app
+        .join("brain")
+        .join(conv_id)
+        .join(".system_generated")
+        .join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+    let compact_lines = format!(
+        "{{\"step_index\":0,\"type\":\"USER_INPUT\",\"created_at\":\"{now_rfc3339}\",\"content\":\"hi\"}}\n\
+         {{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"{now_rfc3339}\",\"input_tokens\":400,\"cache_read_tokens\":1600,\"output_tokens\":150,\"content\":\"done\"}}\n"
+    );
+    std::fs::write(logs.join("transcript.jsonl"), compact_lines).unwrap();
+
+    let rules_dir = gemini
+        .join("config")
+        .join("plugins")
+        .join("test-plugin")
+        .join("rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    std::fs::write(rules_dir.join("base.md"), "Always apply this rule.\n").unwrap();
+
+    let sum_db = app.join("conversation_summaries.db");
+    let conn = Connection::open_with_flags(
+        &sum_db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE conversation_summaries (
+            conversation_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            preview TEXT NOT NULL DEFAULT '',
+            workspace_uris TEXT NOT NULL DEFAULT '',
+            project_id TEXT NOT NULL DEFAULT '',
+            agent_name TEXT NOT NULL DEFAULT '',
+            parent_conversation_id TEXT NOT NULL DEFAULT '',
+            nesting_depth INTEGER NOT NULL DEFAULT 0,
+            last_modified_time TEXT NOT NULL DEFAULT ''
+        );",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO conversation_summaries VALUES (?1, ?2, '', '', '', '', '', 0, ?3)",
+        rusqlite::params![conv_id, "Phase 2 Monitor Test", now_rfc3339],
+    )
+    .unwrap();
+    drop(conn);
+
+    let cfg = MonitorConfig::new(GeminiPaths::from_gemini_dir(&gemini));
+    let handle = MonitorHandle::start(cfg);
+
+    // Explicitly trigger async customization scan and verify snapshot update
+    handle.send(MonitorCommand::RefreshCustomizations);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let s = handle.snapshot();
+        if s.customizations.is_some() && !s.customizations_loading {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let snap_custom = handle.snapshot();
+    assert!(
+        snap_custom.customizations.is_some(),
+        "startup customization inventory should populate asynchronously"
+    );
+
+    handle.send(MonitorCommand::RefreshUsage(UsagePeriod::AllTime));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let s = handle.snapshot();
+        if s.usage_report.is_some() && !s.usage_loading {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let snap_usage = handle.snapshot();
+    let rep = snap_usage
+        .usage_report
+        .expect("RefreshUsage must populate usage_report");
+    assert_eq!(rep.analyzed_sessions, 1);
+    assert_eq!(rep.total_input_tokens, 2000);
+    assert_eq!(rep.total_cached_tokens, 1600);
+    assert_eq!(rep.total_output_tokens, 150);
+
+    // Drop must cancel and join both worker threads promptly
+    let drop_start = Instant::now();
+    drop(handle);
+    assert!(
+        drop_start.elapsed() < Duration::from_secs(2),
+        "MonitorHandle::drop took too long: {:?}",
+        drop_start.elapsed()
     );
 }

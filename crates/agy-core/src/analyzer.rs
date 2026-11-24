@@ -144,7 +144,7 @@ pub struct ContextBuckets {
     pub system_messages: u64,
     pub checkpoint_buffer: u64,
     pub free_space: u64,
-    /// Reserved for Phase 2 customization/MCP breakdown. Always `None` in Phase 1.
+    /// Phase 2 customization/MCP breakdown (populated when available).
     pub customization_breakdown: Option<CustomizationBreakdown>,
 }
 
@@ -325,6 +325,26 @@ pub fn reconcile_active_buckets(buckets: &mut ContextBuckets, target_total: u64)
         *slot -= take;
         remaining -= take;
     }
+
+    if remaining > 0
+        && let Some(custom) = buckets.customization_breakdown.as_mut()
+    {
+        let custom_fields: [&mut u64; 5] = [
+            &mut custom.custom_agents,
+            &mut custom.skills_index,
+            &mut custom.rules_files,
+            &mut custom.mcp_instructions,
+            &mut custom.mcp_tools,
+        ];
+        for slot in custom_fields {
+            if remaining == 0 {
+                break;
+            }
+            let take = (*slot).min(remaining);
+            *slot -= take;
+            remaining -= take;
+        }
+    }
 }
 
 pub fn analyze_conversation(
@@ -342,6 +362,22 @@ pub(crate) fn analyze_conversation_with_meta(
     conv_id: &str,
     explicit_context_limit: Option<u64>,
     pbtxt_override: Option<&Path>,
+) -> std::result::Result<(ConversationAnalysis, bool), CoreError> {
+    analyze_conversation_with_meta_and_customizations(
+        app_data,
+        conv_id,
+        explicit_context_limit,
+        pbtxt_override,
+        None,
+    )
+}
+
+pub(crate) fn analyze_conversation_with_meta_and_customizations(
+    app_data: &Path,
+    conv_id: &str,
+    explicit_context_limit: Option<u64>,
+    pbtxt_override: Option<&Path>,
+    customization_breakdown: Option<CustomizationBreakdown>,
 ) -> std::result::Result<(ConversationAnalysis, bool), CoreError> {
     if !is_valid_conv_id(conv_id) {
         return Err(CoreError::InvalidConversationId(conv_id.to_string()));
@@ -592,18 +628,40 @@ pub(crate) fn analyze_conversation_with_meta(
     let first_sys_msg_tokens = pre_steps_clamped.saturating_sub(first_user_tokens);
     let raw_fixed_baseline = first_prompt.saturating_sub(pre_steps_clamped);
 
-    let (system_tools_base, system_prompt_base) = if raw_fixed_baseline > 0 {
+    let resolved_breakdown = customization_breakdown.unwrap_or_else(|| {
+        app_data
+            .parent()
+            .map(|gemini_dir| {
+                crate::customizations::scan_customizations(
+                    &crate::paths::GeminiPaths::from_gemini_dir(gemini_dir),
+                )
+                .breakdown
+            })
+            .unwrap_or_default()
+    });
+    let custom_always_sum = resolved_breakdown.mcp_tools
+        + resolved_breakdown.mcp_instructions
+        + resolved_breakdown.rules_files
+        + resolved_breakdown.skills_index
+        + resolved_breakdown.custom_agents;
+
+    let (system_tools_base, mut system_prompt_base) = if raw_fixed_baseline > 0 {
         let st = ((raw_fixed_baseline as f64 * 0.42).round() as u64).min(9500);
         let sp = raw_fixed_baseline.saturating_sub(st);
         (st, sp)
     } else {
         (4800, 5200)
     };
+    let mut system_tools_base = system_tools_base;
+    let deduct_sp = system_prompt_base.min(custom_always_sum);
+    system_prompt_base -= deduct_sp;
+    let deduct_st = system_tools_base.min(custom_always_sum - deduct_sp);
+    system_tools_base -= deduct_st;
 
     let mut buckets = ContextBuckets {
         system_tools: system_tools_base,
         system_prompt: system_prompt_base,
-        customization_breakdown: None,
+        customization_breakdown: Some(resolved_breakdown),
         ..Default::default()
     };
 
@@ -617,7 +675,7 @@ pub(crate) fn analyze_conversation_with_meta(
         cumulative_output_tokens += steps[idx].output_tokens.unwrap_or(0);
     }
 
-    let fixed_baseline_sum = buckets.system_tools + buckets.system_prompt;
+    let fixed_baseline_sum = buckets.system_tools + buckets.system_prompt + custom_always_sum;
     for cp in &mut compactions {
         if cp.after_tokens.is_none() {
             let after = fixed_baseline_sum + cp.summary_tokens;
@@ -680,13 +738,42 @@ pub(crate) fn analyze_conversation_with_meta(
             buckets.user_messages = first_user_tokens;
             buckets.system_messages = first_sys_msg_tokens;
         } else {
+            let current_custom = buckets
+                .customization_breakdown
+                .as_ref()
+                .map(|c| {
+                    c.mcp_tools
+                        + c.mcp_instructions
+                        + c.rules_files
+                        + c.skills_index
+                        + c.custom_agents
+                })
+                .unwrap_or(0);
             let max_fixed = (anchor_prompt as f64 * 0.85) as u64;
             if fixed_baseline_sum > max_fixed && fixed_baseline_sum > 0 {
                 let s = (anchor_prompt as f64 * 0.85) / fixed_baseline_sum as f64;
                 buckets.system_tools = (buckets.system_tools as f64 * s).round() as u64;
                 buckets.system_prompt = (buckets.system_prompt as f64 * s).round() as u64;
+                if let Some(custom) = buckets.customization_breakdown.as_mut() {
+                    custom.mcp_tools = (custom.mcp_tools as f64 * s).round() as u64;
+                    custom.mcp_instructions = (custom.mcp_instructions as f64 * s).round() as u64;
+                    custom.rules_files = (custom.rules_files as f64 * s).round() as u64;
+                    custom.skills_index = (custom.skills_index as f64 * s).round() as u64;
+                    custom.custom_agents = (custom.custom_agents as f64 * s).round() as u64;
+                }
             }
-            let adjusted_fixed = buckets.system_tools + buckets.system_prompt;
+            let adjusted_custom = buckets
+                .customization_breakdown
+                .as_ref()
+                .map(|c| {
+                    c.mcp_tools
+                        + c.mcp_instructions
+                        + c.rules_files
+                        + c.skills_index
+                        + c.custom_agents
+                })
+                .unwrap_or(current_custom);
+            let adjusted_fixed = buckets.system_tools + buckets.system_prompt + adjusted_custom;
             let available_post_fixed = anchor_prompt.saturating_sub(adjusted_fixed);
 
             let cp_idx = last_compaction_step_idx.unwrap_or(0);

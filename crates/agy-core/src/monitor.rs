@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -7,11 +7,17 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
-use crate::analyzer::{ConversationAnalysis, analyze_conversation_with_meta};
+use crate::analyzer::{
+    ConversationAnalysis, CustomizationBreakdown, analyze_conversation_with_meta_and_customizations,
+};
+use crate::customizations::{CustomizationInventory, scan_customizations_cancellable};
 use crate::fingerprint::{DbFingerprint, FileStamp, TranscriptFingerprint};
 use crate::models::detect_conversation_model_label_from_db;
 use crate::paths::GeminiPaths;
 use crate::sessions::{SessionIndex, load_session_index};
+use crate::usage::{
+    DEFAULT_MAX_USAGE_SESSIONS, UsageCache, UsagePeriod, UsageReport, aggregate_usage,
+};
 
 const MAX_MODEL_SCANS_PER_TICK: usize = 40;
 const MODEL_BACKFILL_INTERVAL: Duration = Duration::from_millis(50);
@@ -22,6 +28,8 @@ pub enum MonitorCommand {
     SetFollowLatest(bool),
     SetPaused(bool),
     RefreshNow,
+    RefreshUsage(UsagePeriod),
+    RefreshCustomizations,
     Shutdown,
 }
 
@@ -36,6 +44,10 @@ pub struct MonitorSnapshot {
     pub last_error: Option<String>,
     pub db_busy: bool,
     pub analysis_count: u64,
+    pub usage_report: Option<UsageReport>,
+    pub usage_loading: bool,
+    pub customizations: Option<CustomizationInventory>,
+    pub customizations_loading: bool,
 }
 
 impl Default for MonitorSnapshot {
@@ -50,6 +62,10 @@ impl Default for MonitorSnapshot {
             last_error: None,
             db_busy: false,
             analysis_count: 0,
+            usage_report: None,
+            usage_loading: false,
+            customizations: None,
+            customizations_loading: false,
         }
     }
 }
@@ -82,10 +98,28 @@ struct AnalysisCacheKey {
 
 pub struct MonitorHandle {
     tx: Sender<MonitorCommand>,
+    phase2_tx: Sender<Phase2Cmd>,
+    shutdown_flag: Arc<AtomicBool>,
+    usage_cancel: Arc<Mutex<Arc<AtomicBool>>>,
+    custom_cancel: Arc<Mutex<Arc<AtomicBool>>>,
     snapshot: Arc<Mutex<MonitorSnapshot>>,
     index_reload_count: Arc<AtomicU64>,
     model_scan_count: Arc<AtomicU64>,
     thread: Option<JoinHandle<()>>,
+    phase2_thread: Option<JoinHandle<()>>,
+}
+
+enum Phase2Cmd {
+    RefreshUsage {
+        period: UsagePeriod,
+        generation: u64,
+        cancel: Arc<AtomicBool>,
+    },
+    RefreshCustomizations {
+        generation: u64,
+        cancel: Arc<AtomicBool>,
+    },
+    Shutdown,
 }
 
 impl MonitorHandle {
@@ -100,26 +134,100 @@ impl MonitorHandle {
         let reload_count_clone = Arc::clone(&index_reload_count);
         let model_scan_count = Arc::new(AtomicU64::new(0));
         let scan_count_clone = Arc::clone(&model_scan_count);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let usage_cancel = Arc::new(Mutex::new(Arc::new(AtomicBool::new(false))));
+        let custom_cancel = Arc::new(Mutex::new(Arc::new(AtomicBool::new(false))));
+        let latest_breakdown = Arc::new(Mutex::new(None::<CustomizationBreakdown>));
+        let latest_index = Arc::new(Mutex::new(None::<SessionIndex>));
+        let usage_gen = Arc::new(AtomicU64::new(0));
+        let custom_gen = Arc::new(AtomicU64::new(0));
+
         let (tx, rx) = mpsc::channel::<MonitorCommand>();
+        let (phase2_tx, phase2_rx) = mpsc::channel::<Phase2Cmd>();
+
+        let poller_breakdown = Arc::clone(&latest_breakdown);
+        let poller_index = Arc::clone(&latest_index);
+        let poller_phase2_tx = phase2_tx.clone();
+        let poller_shutdown = Arc::clone(&shutdown_flag);
+        let poller_usage_cancel = Arc::clone(&usage_cancel);
+        let poller_custom_cancel = Arc::clone(&custom_cancel);
+        let poller_usage_gen = Arc::clone(&usage_gen);
+        let poller_custom_gen = Arc::clone(&custom_gen);
+        let poller_config_paths = config.paths.clone();
+        let poller_notify = config.notify.clone();
 
         let thread = thread::Builder::new()
             .name("agy-monitor-poller".to_string())
             .spawn(move || {
-                run_poller(config, rx, snap_clone, reload_count_clone, scan_count_clone);
+                run_poller(
+                    config,
+                    rx,
+                    snap_clone,
+                    reload_count_clone,
+                    scan_count_clone,
+                    poller_breakdown,
+                    poller_index,
+                    poller_phase2_tx,
+                    poller_shutdown,
+                    poller_usage_cancel,
+                    poller_custom_cancel,
+                    poller_usage_gen,
+                    poller_custom_gen,
+                );
             })
             .expect("failed to spawn monitor polling thread");
 
+        let p2_snap = Arc::clone(&snapshot);
+        let p2_breakdown = Arc::clone(&latest_breakdown);
+        let p2_index = Arc::clone(&latest_index);
+        let p2_shutdown = Arc::clone(&shutdown_flag);
+        let phase2_thread = thread::Builder::new()
+            .name("agy-monitor-phase2".to_string())
+            .spawn(move || {
+                run_phase2_worker(
+                    poller_config_paths,
+                    poller_notify,
+                    phase2_rx,
+                    p2_snap,
+                    p2_breakdown,
+                    p2_index,
+                    p2_shutdown,
+                    usage_gen,
+                    custom_gen,
+                );
+            })
+            .expect("failed to spawn monitor phase2 worker");
+
         Self {
             tx,
+            phase2_tx,
+            shutdown_flag,
+            usage_cancel,
+            custom_cancel,
             snapshot,
             index_reload_count,
             model_scan_count,
             thread: Some(thread),
+            phase2_thread: Some(phase2_thread),
         }
     }
 
     pub fn send(&self, cmd: MonitorCommand) {
+        if matches!(cmd, MonitorCommand::Shutdown) {
+            self.signal_cancel_all();
+        }
         let _ = self.tx.send(cmd);
+    }
+
+    fn signal_cancel_all(&self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+        if let Ok(guard) = self.usage_cancel.lock() {
+            guard.store(true, Ordering::SeqCst);
+        }
+        if let Ok(guard) = self.custom_cancel.lock() {
+            guard.store(true, Ordering::SeqCst);
+        }
+        let _ = self.phase2_tx.send(Phase2Cmd::Shutdown);
     }
 
     pub fn snapshot(&self) -> MonitorSnapshot {
@@ -137,19 +245,32 @@ impl MonitorHandle {
 
 impl Drop for MonitorHandle {
     fn drop(&mut self) {
+        self.signal_cancel_all();
         let _ = self.tx.send(MonitorCommand::Shutdown);
         if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.phase2_thread.take() {
             let _ = handle.join();
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_poller(
     config: MonitorConfig,
     rx: mpsc::Receiver<MonitorCommand>,
     snapshot: Arc<Mutex<MonitorSnapshot>>,
     index_reload_count: Arc<AtomicU64>,
     model_scan_count: Arc<AtomicU64>,
+    latest_breakdown: Arc<Mutex<Option<CustomizationBreakdown>>>,
+    latest_index: Arc<Mutex<Option<SessionIndex>>>,
+    phase2_tx: Sender<Phase2Cmd>,
+    shutdown_flag: Arc<AtomicBool>,
+    usage_cancel: Arc<Mutex<Arc<AtomicBool>>>,
+    custom_cancel: Arc<Mutex<Arc<AtomicBool>>>,
+    usage_gen: Arc<AtomicU64>,
+    custom_gen: Arc<AtomicU64>,
 ) {
     let mut follow_latest = config.follow_latest;
     let mut paused = false;
@@ -178,11 +299,16 @@ fn run_poller(
         false,
         &index_reload_count,
         &model_scan_count,
+        &latest_breakdown,
+        &latest_index,
         &snapshot,
     );
     let mut last_full_poll_at = Instant::now();
 
     loop {
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
         let wait_timeout = if !paused && pending_backfill {
             config
                 .poll_interval
@@ -210,6 +336,12 @@ fn run_poller(
                         &mut force_reanalyze,
                         &snapshot,
                         &config.notify,
+                        &phase2_tx,
+                        &shutdown_flag,
+                        &usage_cancel,
+                        &custom_cancel,
+                        &usage_gen,
+                        &custom_gen,
                     ),
                     CommandOutcome::Exit
                 ) {
@@ -228,6 +360,12 @@ fn run_poller(
                             &mut force_reanalyze,
                             &snapshot,
                             &config.notify,
+                            &phase2_tx,
+                            &shutdown_flag,
+                            &usage_cancel,
+                            &custom_cancel,
+                            &usage_gen,
+                            &custom_gen,
                         ),
                         CommandOutcome::Exit
                     ) {
@@ -252,6 +390,8 @@ fn run_poller(
                         force_reanalyze,
                         &index_reload_count,
                         &model_scan_count,
+                        &latest_breakdown,
+                        &latest_index,
                         &snapshot,
                     );
                     last_full_poll_at = Instant::now();
@@ -277,6 +417,8 @@ fn run_poller(
                             false,
                             &index_reload_count,
                             &model_scan_count,
+                            &latest_breakdown,
+                            &latest_index,
                             &snapshot,
                         );
                         last_full_poll_at = Instant::now();
@@ -300,6 +442,171 @@ fn run_poller(
     }
 }
 
+fn dispatch_usage_refresh(
+    period: UsagePeriod,
+    snapshot: &Arc<Mutex<MonitorSnapshot>>,
+    notify: &Option<Arc<dyn Fn() + Send + Sync>>,
+    phase2_tx: &Sender<Phase2Cmd>,
+    shutdown_flag: &Arc<AtomicBool>,
+    usage_cancel: &Arc<Mutex<Arc<AtomicBool>>>,
+    usage_gen: &Arc<AtomicU64>,
+) {
+    if shutdown_flag.load(Ordering::SeqCst) {
+        return;
+    }
+    let generation = usage_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let next_cancel = Arc::new(AtomicBool::new(false));
+    if let Ok(mut guard) = usage_cancel.lock() {
+        guard.store(true, Ordering::SeqCst);
+        *guard = Arc::clone(&next_cancel);
+        if shutdown_flag.load(Ordering::SeqCst) {
+            next_cancel.store(true, Ordering::SeqCst);
+            return;
+        }
+    }
+    if let Ok(mut guard) = snapshot.lock() {
+        guard.usage_loading = true;
+    }
+    if let Some(cb) = notify {
+        cb();
+    }
+    let _ = phase2_tx.send(Phase2Cmd::RefreshUsage {
+        period,
+        generation,
+        cancel: next_cancel,
+    });
+}
+
+fn dispatch_customizations_refresh(
+    snapshot: &Arc<Mutex<MonitorSnapshot>>,
+    notify: &Option<Arc<dyn Fn() + Send + Sync>>,
+    phase2_tx: &Sender<Phase2Cmd>,
+    shutdown_flag: &Arc<AtomicBool>,
+    custom_cancel: &Arc<Mutex<Arc<AtomicBool>>>,
+    custom_gen: &Arc<AtomicU64>,
+) {
+    if shutdown_flag.load(Ordering::SeqCst) {
+        return;
+    }
+    let generation = custom_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let next_cancel = Arc::new(AtomicBool::new(false));
+    if let Ok(mut guard) = custom_cancel.lock() {
+        guard.store(true, Ordering::SeqCst);
+        *guard = Arc::clone(&next_cancel);
+        if shutdown_flag.load(Ordering::SeqCst) {
+            next_cancel.store(true, Ordering::SeqCst);
+            return;
+        }
+    }
+    if let Ok(mut guard) = snapshot.lock() {
+        guard.customizations_loading = true;
+    }
+    if let Some(cb) = notify {
+        cb();
+    }
+    let _ = phase2_tx.send(Phase2Cmd::RefreshCustomizations {
+        generation,
+        cancel: next_cancel,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_phase2_worker(
+    paths: GeminiPaths,
+    notify: Option<Arc<dyn Fn() + Send + Sync>>,
+    rx: mpsc::Receiver<Phase2Cmd>,
+    snapshot: Arc<Mutex<MonitorSnapshot>>,
+    latest_breakdown: Arc<Mutex<Option<CustomizationBreakdown>>>,
+    latest_index: Arc<Mutex<Option<SessionIndex>>>,
+    shutdown_flag: Arc<AtomicBool>,
+    usage_gen: Arc<AtomicU64>,
+    custom_gen: Arc<AtomicU64>,
+) {
+    let mut usage_cache = UsageCache::new();
+
+    while let Ok(cmd) = rx.recv() {
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+        match cmd {
+            Phase2Cmd::Shutdown => break,
+            Phase2Cmd::RefreshUsage {
+                period,
+                generation,
+                cancel,
+            } => {
+                if shutdown_flag.load(Ordering::SeqCst)
+                    || cancel.load(Ordering::SeqCst)
+                    || usage_gen.load(Ordering::SeqCst) != generation
+                {
+                    continue;
+                }
+                let index = latest_index
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .unwrap_or_else(|| load_session_index(&paths));
+                if shutdown_flag.load(Ordering::SeqCst)
+                    || cancel.load(Ordering::SeqCst)
+                    || usage_gen.load(Ordering::SeqCst) != generation
+                {
+                    continue;
+                }
+                let report = aggregate_usage(
+                    &index,
+                    period,
+                    DEFAULT_MAX_USAGE_SESSIONS,
+                    &mut usage_cache,
+                    &cancel,
+                );
+                if shutdown_flag.load(Ordering::SeqCst)
+                    || usage_gen.load(Ordering::SeqCst) != generation
+                {
+                    continue;
+                }
+                if let Ok(mut guard) = snapshot.lock() {
+                    if let Some(rep) = report {
+                        guard.usage_report = Some(rep);
+                    }
+                    guard.usage_loading = false;
+                }
+                if let Some(cb) = &notify {
+                    cb();
+                }
+            }
+            Phase2Cmd::RefreshCustomizations { generation, cancel } => {
+                if shutdown_flag.load(Ordering::SeqCst)
+                    || cancel.load(Ordering::SeqCst)
+                    || custom_gen.load(Ordering::SeqCst) != generation
+                {
+                    continue;
+                }
+                let inv = scan_customizations_cancellable(&paths, &cancel);
+                if shutdown_flag.load(Ordering::SeqCst)
+                    || custom_gen.load(Ordering::SeqCst) != generation
+                {
+                    continue;
+                }
+                if let Some(inv_val) = inv {
+                    let bd = inv_val.breakdown.clone();
+                    if let Ok(mut guard) = latest_breakdown.lock() {
+                        *guard = Some(bd);
+                    }
+                    if let Ok(mut guard) = snapshot.lock() {
+                        guard.customizations = Some(inv_val);
+                        guard.customizations_loading = false;
+                    }
+                } else if let Ok(mut guard) = snapshot.lock() {
+                    guard.customizations_loading = false;
+                }
+                if let Some(cb) = &notify {
+                    cb();
+                }
+            }
+        }
+    }
+}
+
 enum CommandOutcome {
     Continue,
     Exit,
@@ -315,6 +622,12 @@ fn apply_command(
     force_reanalyze: &mut bool,
     snapshot: &Arc<Mutex<MonitorSnapshot>>,
     notify: &Option<Arc<dyn Fn() + Send + Sync>>,
+    phase2_tx: &Sender<Phase2Cmd>,
+    shutdown_flag: &Arc<AtomicBool>,
+    usage_cancel: &Arc<Mutex<Arc<AtomicBool>>>,
+    custom_cancel: &Arc<Mutex<Arc<AtomicBool>>>,
+    usage_gen: &Arc<AtomicU64>,
+    custom_gen: &Arc<AtomicU64>,
 ) -> CommandOutcome {
     match cmd {
         MonitorCommand::SelectConversation(id) => {
@@ -341,6 +654,27 @@ fn apply_command(
         MonitorCommand::RefreshNow => {
             *should_poll = true;
             *force_reanalyze = true;
+        }
+        MonitorCommand::RefreshUsage(period) => {
+            dispatch_usage_refresh(
+                period,
+                snapshot,
+                notify,
+                phase2_tx,
+                shutdown_flag,
+                usage_cancel,
+                usage_gen,
+            );
+        }
+        MonitorCommand::RefreshCustomizations => {
+            dispatch_customizations_refresh(
+                snapshot,
+                notify,
+                phase2_tx,
+                shutdown_flag,
+                custom_cancel,
+                custom_gen,
+            );
         }
         MonitorCommand::Shutdown => return CommandOutcome::Exit,
     }
@@ -378,6 +712,8 @@ fn perform_poll(
     force_reanalyze: bool,
     index_reload_count: &Arc<AtomicU64>,
     model_scan_count: &Arc<AtomicU64>,
+    latest_breakdown: &Arc<Mutex<Option<CustomizationBreakdown>>>,
+    latest_index: &Arc<Mutex<Option<SessionIndex>>>,
     snapshot: &Arc<Mutex<MonitorSnapshot>>,
 ) -> bool {
     index_reload_count.fetch_add(1, Ordering::SeqCst);
@@ -425,7 +761,22 @@ fn perform_poll(
 
             let cache_hit = !force_reanalyze && cached_key.as_ref() == Some(&key);
             if !cache_hit {
-                match analyze_conversation_with_meta(app_data, &conv_id, None, None) {
+                let breakdown = {
+                    let cached_bd = latest_breakdown.lock().ok().and_then(|g| g.clone());
+                    if let Some(bd) = cached_bd {
+                        Some(bd)
+                    } else {
+                        let bd =
+                            crate::customizations::scan_customizations(&config.paths).breakdown;
+                        if let Ok(mut guard) = latest_breakdown.lock() {
+                            *guard = Some(bd.clone());
+                        }
+                        Some(bd)
+                    }
+                };
+                match analyze_conversation_with_meta_and_customizations(
+                    app_data, &conv_id, None, None, breakdown,
+                ) {
                     Ok((res, model_from_db)) => {
                         analysis_db_busy = res.db_busy;
                         // Do not freeze the cache key if the DB was busy so the next poll
@@ -472,6 +823,9 @@ fn perform_poll(
     let db_busy = index.db_busy || analysis_db_busy;
     let now = Utc::now();
 
+    if let Ok(mut guard) = latest_index.lock() {
+        *guard = Some(index.clone());
+    }
     if let Ok(mut guard) = snapshot.lock() {
         guard.index = index.clone();
         guard.selected_id = selected_id.clone();

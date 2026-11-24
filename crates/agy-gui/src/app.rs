@@ -13,6 +13,7 @@ use egui_plot::{Corner, HLine, Legend, Line, Plot, PlotPoints, Points, VLine};
 
 use crate::fonts::install_japanese_fonts;
 use crate::theme::{Palette, ThemeMode, apply_theme};
+use crate::usage_view::{UsageViewState, render_usage_phase2};
 
 const COMPACT_SIZE: egui::Vec2 = egui::vec2(380.0, 170.0);
 const DEFAULT_NORMAL_SIZE: egui::Vec2 = egui::vec2(1240.0, 820.0);
@@ -42,6 +43,8 @@ pub struct AgyMonitorApp {
     search_query: String,
     expanded_roots: HashSet<String>,
     copied_until: Option<Instant>,
+    usage_view_state: UsageViewState,
+    phase2_initialized: bool,
 }
 
 impl AgyMonitorApp {
@@ -70,6 +73,8 @@ impl AgyMonitorApp {
             search_query: String::new(),
             expanded_roots: HashSet::new(),
             copied_until: None,
+            usage_view_state: UsageViewState::default(),
+            phase2_initialized: false,
         }
     }
 
@@ -133,16 +138,29 @@ impl AgyMonitorApp {
 
         match self.main_tab {
             MainTab::UsagePhase2 => {
+                if !self.phase2_initialized {
+                    self.phase2_initialized = true;
+                    self.monitor.send(MonitorCommand::RefreshUsage(
+                        self.usage_view_state.selected_period,
+                    ));
+                    self.monitor.send(MonitorCommand::RefreshCustomizations);
+                }
                 egui::CentralPanel::default().show(ui, |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "期間統計・カスタマイズ / MCP 棚卸し (Phase 2 で実装予定)",
-                            )
-                            .size(15.0)
-                            .color(palette.text_muted),
-                        );
-                    });
+                    let actions = render_usage_phase2(
+                        ui,
+                        &mut self.usage_view_state,
+                        snap.usage_report.as_ref(),
+                        snap.usage_loading,
+                        snap.customizations.as_ref(),
+                        snap.customizations_loading,
+                        &palette,
+                    );
+                    if let Some(period) = actions.refresh_usage {
+                        self.monitor.send(MonitorCommand::RefreshUsage(period));
+                    }
+                    if actions.refresh_customizations {
+                        self.monitor.send(MonitorCommand::RefreshCustomizations);
+                    }
                 });
             }
             MainTab::Realtime => {
@@ -163,11 +181,7 @@ impl AgyMonitorApp {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.main_tab, MainTab::Realtime, "リアルタイム監視");
-                ui.selectable_value(
-                    &mut self.main_tab,
-                    MainTab::UsagePhase2,
-                    "期間統計 (Phase 2)",
-                );
+                ui.selectable_value(&mut self.main_tab, MainTab::UsagePhase2, "期間統計・棚卸し");
 
                 ui.separator();
 
@@ -794,13 +808,21 @@ impl AgyMonitorApp {
         palette: &Palette,
     ) {
         let b = &analysis.buckets;
+        let custom_total = b
+            .customization_breakdown
+            .as_ref()
+            .map(|c| {
+                c.mcp_tools + c.mcp_instructions + c.rules_files + c.skills_index + c.custom_agents
+            })
+            .unwrap_or(0);
         let sys_total = b.system_tools + b.system_prompt + b.system_messages;
-        let segments: [(&str, u64, egui::Color32); 8] = [
+        let segments: [(&str, u64, egui::Color32); 9] = [
             ("ユーザー", b.user_messages, palette.bucket_user),
             ("応答", b.agent_replies, palette.bucket_reply),
             ("思考", b.agent_thinking, palette.bucket_thinking),
             ("ツール引数", b.tool_call_args, palette.bucket_tool_args),
             ("ツール出力", b.tool_call_outputs, palette.bucket_tool_out),
+            ("カスタマイズ", custom_total, palette.accent),
             ("システム", sys_total, palette.bucket_system),
             (
                 "圧縮バッファ",
@@ -1567,6 +1589,10 @@ mod tests {
             last_error: None,
             db_busy: false,
             analysis_count: 1,
+            usage_report: None,
+            usage_loading: false,
+            customizations: None,
+            customizations_loading: false,
         }
     }
 
@@ -1589,6 +1615,8 @@ mod tests {
             search_query: String::new(),
             expanded_roots: HashSet::new(),
             copied_until: None,
+            usage_view_state: UsageViewState::default(),
+            phase2_initialized: false,
         };
         (tmp, app)
     }
