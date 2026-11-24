@@ -3,8 +3,9 @@ use agy_core::customizations::{
     CustomizationInventory, CustomizationItem, CustomizationKind, LoadTiming,
 };
 use agy_core::usage::{DailyUsagePoint, UsageBreakdownRow, UsagePeriod, UsageReport};
+use chrono::{Days, NaiveDate};
 use eframe::egui;
-use egui_plot::{Corner, Legend, Line, Plot, PlotPoints, Points};
+use egui_plot::{Corner, HoverPosition, Legend, Line, Plot, PlotPoints, Points};
 
 use crate::theme::Palette;
 
@@ -221,6 +222,18 @@ fn render_usage_stats_view(
             });
     }
 
+    ui.add_space(6.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "※集計基準: 会話の最終更新日（ローカル日付）ごとにセッション累計を集計",
+            )
+            .small()
+            .color(palette.text_muted),
+        )
+        .wrap(),
+    );
+
     ui.add_space(8.0);
     render_usage_kpis(ui, report, palette);
 
@@ -404,6 +417,69 @@ fn render_usage_kpis(ui: &mut egui::Ui, report: &UsageReport, palette: &Palette)
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct DailyPlotSeries {
+    base_date: Option<NaiveDate>,
+    input_pts: Vec<[f64; 2]>,
+    cached_pts: Vec<[f64; 2]>,
+    output_pts: Vec<[f64; 2]>,
+    fallback_labels: Vec<String>,
+}
+
+fn build_daily_plot_series(daily: &[DailyUsagePoint]) -> DailyPlotSeries {
+    let parsed_dates: Vec<Option<NaiveDate>> = daily
+        .iter()
+        .map(|d| NaiveDate::parse_from_str(&d.date_ymd, "%Y-%m-%d").ok())
+        .collect();
+    let base_date = parsed_dates.iter().flatten().copied().min();
+
+    let mut input_pts = Vec::with_capacity(daily.len());
+    let mut cached_pts = Vec::with_capacity(daily.len());
+    let mut output_pts = Vec::with_capacity(daily.len());
+    let mut fallback_labels = Vec::with_capacity(daily.len());
+
+    for (idx, (d, parsed)) in daily.iter().zip(parsed_dates.iter()).enumerate() {
+        let x = match (base_date, parsed) {
+            (Some(base), Some(date)) => (*date - base).num_days() as f64,
+            _ => idx as f64,
+        };
+        input_pts.push([x, d.input_tokens as f64]);
+        cached_pts.push([x, d.cached_tokens as f64]);
+        output_pts.push([x, d.output_tokens as f64]);
+        fallback_labels.push(d.date_ymd.get(5..).unwrap_or(&d.date_ymd).to_string());
+    }
+
+    DailyPlotSeries {
+        base_date,
+        input_pts,
+        cached_pts,
+        output_pts,
+        fallback_labels,
+    }
+}
+
+fn format_plot_day(
+    x: f64,
+    base_date: Option<NaiveDate>,
+    fallback_labels: &[String],
+    date_fmt: &str,
+) -> Option<String> {
+    let rounded = x.round();
+    if rounded < 0.0 || !rounded.is_finite() {
+        return None;
+    }
+    let offset = rounded as u64;
+    if let Some(base) = base_date {
+        base.checked_add_days(Days::new(offset))
+            .map(|date| date.format(date_fmt).to_string())
+    } else {
+        usize::try_from(offset)
+            .ok()
+            .and_then(|i| fallback_labels.get(i))
+            .cloned()
+    }
+}
+
 fn render_daily_plot(ui: &mut egui::Ui, daily: &[DailyUsagePoint], palette: &Palette) {
     ui.label(egui::RichText::new("日別トークン推移").strong());
     if daily.is_empty() {
@@ -418,31 +494,19 @@ fn render_daily_plot(ui: &mut egui::Ui, daily: &[DailyUsagePoint], palette: &Pal
     let plot_w = ui.available_width().max(120.0);
     let plot_h = 165.0;
 
-    let input_pts: Vec<[f64; 2]> = daily
-        .iter()
-        .enumerate()
-        .map(|(idx, d)| [idx as f64 + 1.0, d.input_tokens as f64])
-        .collect();
-    let cached_pts: Vec<[f64; 2]> = daily
-        .iter()
-        .enumerate()
-        .map(|(idx, d)| [idx as f64 + 1.0, d.cached_tokens as f64])
-        .collect();
-    let output_pts: Vec<[f64; 2]> = daily
-        .iter()
-        .enumerate()
-        .map(|(idx, d)| [idx as f64 + 1.0, d.output_tokens as f64])
-        .collect();
-
+    let series = build_daily_plot_series(daily);
     let max_y = daily
         .iter()
         .map(|d| d.input_tokens.max(d.cached_tokens).max(d.output_tokens))
         .max()
         .unwrap_or(0) as f64;
-    let date_labels: Vec<String> = daily
-        .iter()
-        .map(|d| d.date_ymd.get(5..).unwrap_or(&d.date_ymd).to_string())
-        .collect();
+    let x_axis_base = series.base_date;
+    let x_axis_fallback = series.fallback_labels.clone();
+    let label_base = series.base_date;
+    let label_fallback = series.fallback_labels;
+    let input_pts = series.input_pts;
+    let cached_pts = series.cached_pts;
+    let output_pts = series.output_pts;
 
     Plot::new("usage_daily_plot")
         .height(plot_h)
@@ -454,13 +518,33 @@ fn render_daily_plot(ui: &mut egui::Ui, daily: &[DailyUsagePoint], palette: &Pal
         .include_y((max_y * 1.1).max(10.0))
         .x_axis_formatter(move |mark, _range| {
             let rounded = mark.value.round();
-            if (mark.value - rounded).abs() < 0.01 && rounded >= 1.0 {
-                let idx = (rounded as usize).saturating_sub(1);
-                if let Some(lbl) = date_labels.get(idx) {
-                    return lbl.clone();
-                }
+            if (mark.value - rounded).abs() < 0.01 {
+                return format_plot_day(rounded, x_axis_base, &x_axis_fallback, "%m-%d")
+                    .unwrap_or_default();
             }
             String::new()
+        })
+        .label_formatter(move |pos| match pos {
+            HoverPosition::NearDataPoint {
+                plot_name,
+                position,
+                ..
+            } => {
+                let date_str = format_plot_day(position.x, label_base, &label_fallback, "%Y-%m-%d")
+                    .unwrap_or_else(|| format!("{:.0}", position.x));
+                let tok_str = format_tokens(position.y.round().max(0.0) as u64);
+                if plot_name.is_empty() {
+                    Some(format!("{date_str}: {tok_str}"))
+                } else {
+                    Some(format!("{plot_name}\n{date_str}: {tok_str}"))
+                }
+            }
+            HoverPosition::Elsewhere { position } => {
+                let date_str =
+                    format_plot_day(position.x, label_base, &label_fallback, "%Y-%m-%d")?;
+                let tok_str = format_tokens(position.y.round().max(0.0) as u64);
+                Some(format!("{date_str}: {tok_str}"))
+            }
         })
         .legend(Legend::default().position(Corner::LeftTop))
         .show(ui, |plot_ui| {
@@ -535,6 +619,15 @@ fn render_breakdown_table(
         return;
     }
 
+    if !query.is_empty() && matched_count == 0 {
+        ui.label(
+            egui::RichText::new("一致する項目はありません")
+                .small()
+                .color(palette.text_muted),
+        );
+        return;
+    }
+
     egui::ScrollArea::horizontal()
         .id_salt(format!("{id_salt}_hscroll"))
         .auto_shrink([false, true])
@@ -554,17 +647,18 @@ fn render_breakdown_table(
 
                     for row in rows {
                         let is_match = !query.is_empty() && row_matches_filter(row, &query);
+                        if !query.is_empty() && !is_match {
+                            continue;
+                        }
                         let label_text = if row.label.is_empty() {
                             &row.key
                         } else {
                             &row.label
                         };
-                        let label_color = if query.is_empty() {
-                            palette.text_primary
-                        } else if is_match {
+                        let label_color = if is_match {
                             palette.accent
                         } else {
-                            palette.text_muted
+                            palette.text_primary
                         };
                         let mut rich =
                             egui::RichText::new(truncate_ui(label_text, 40)).color(label_color);
@@ -1450,6 +1544,168 @@ mod tests {
         assert!(
             !texts_filtered.iter().any(|(t, _, _)| t == "item-00"),
             "non-matching items must be excluded"
+        );
+    }
+
+    #[test]
+    fn gui_13_project_filter_hides_non_matching_rows_and_daily_plot_uses_date_spacing() {
+        // 1. Verify sparse dates map to calendar day offsets rather than sequential indices.
+        let sparse_daily = vec![
+            DailyUsagePoint {
+                date_ymd: "2026-11-01".to_string(),
+                session_count: 2,
+                input_tokens: 100_000,
+                cached_tokens: 50_000,
+                output_tokens: 10_000,
+                compaction_count: 0,
+            },
+            DailyUsagePoint {
+                date_ymd: "2026-11-02".to_string(),
+                session_count: 3,
+                input_tokens: 200_000,
+                cached_tokens: 100_000,
+                output_tokens: 20_000,
+                compaction_count: 1,
+            },
+            DailyUsagePoint {
+                date_ymd: "2026-11-24".to_string(),
+                session_count: 4,
+                input_tokens: 300_000,
+                cached_tokens: 150_000,
+                output_tokens: 30_000,
+                compaction_count: 2,
+            },
+        ];
+        let series = build_daily_plot_series(&sparse_daily);
+        assert_eq!(series.base_date, NaiveDate::from_ymd_opt(2026, 11, 1));
+        let xs = |pts: &[[f64; 2]]| pts.iter().map(|p| p[0]).collect::<Vec<_>>();
+        assert_eq!(xs(&series.input_pts), vec![0.0, 1.0, 23.0]);
+        assert_eq!(xs(&series.cached_pts), vec![0.0, 1.0, 23.0]);
+        assert_eq!(xs(&series.output_pts), vec![0.0, 1.0, 23.0]);
+        assert_eq!(
+            format_plot_day(0.0, series.base_date, &series.fallback_labels, "%m-%d"),
+            Some("11-01".to_string())
+        );
+        assert_eq!(
+            format_plot_day(23.0, series.base_date, &series.fallback_labels, "%Y-%m-%d"),
+            Some("2026-11-24".to_string())
+        );
+
+        // Fallback when date strings cannot be parsed.
+        let invalid_daily = vec![
+            DailyUsagePoint {
+                date_ymd: "invalid-a".to_string(),
+                ..sparse_daily[0].clone()
+            },
+            DailyUsagePoint {
+                date_ymd: "invalid-b".to_string(),
+                ..sparse_daily[1].clone()
+            },
+        ];
+        let fallback_series = build_daily_plot_series(&invalid_daily);
+        assert_eq!(fallback_series.base_date, None);
+        assert_eq!(xs(&fallback_series.input_pts), vec![0.0, 1.0]);
+
+        // 2. Verify project filter hides non-matching rows in narrow viewport UI while keeping
+        //    model/surface tables intact and displaying the aggregation-basis note.
+        let mut report = sample_usage_report(false);
+        report.daily = sparse_daily;
+
+        let ctx = egui::Context::default();
+        install_japanese_fonts(&ctx);
+        apply_theme(&ctx, ThemeMode::Dark);
+        let palette = Palette::for_mode(ThemeMode::Dark);
+
+        let run_stats_frame = |state: &mut UsageViewState, viewport: egui::Vec2, label: &str| {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw_input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let _ =
+                        render_usage_phase2(ui, state, Some(&report), false, None, false, &palette);
+                });
+            });
+            assert_clips_within_viewport(&output.shapes, viewport.x, viewport.y, label);
+            let texts = collect_rendered_texts(&output.shapes);
+            assert_no_cost_currency_text(&texts);
+            output.textures_delta.clear();
+            texts
+        };
+
+        let mut state = UsageViewState {
+            sub_tab: Phase2SubTab::UsageStats,
+            project_filter: "agy-monitor".to_string(),
+            ..Default::default()
+        };
+
+        // Short narrow viewport (520x480) checks clipping and top-of-view aggregation note.
+        let short_narrow = egui::vec2(520.0, 480.0);
+        let _ = run_stats_frame(&mut state, short_narrow, "gui_13_short_warmup");
+        let texts_short = run_stats_frame(&mut state, short_narrow, "gui_13_short");
+        assert!(
+            texts_short.iter().any(|(t, _, _)| t
+                .contains("※集計基準: 会話の最終更新日（ローカル日付）ごとにセッション累計を集計")),
+            "aggregation basis note must be rendered"
+        );
+
+        // Tall narrow viewport (520x1100) keeps all three breakdown tables visible at once.
+        let tall_narrow = egui::vec2(520.0, 1100.0);
+        let _ = run_stats_frame(&mut state, tall_narrow, "gui_13_match_warmup");
+        let texts_match = run_stats_frame(&mut state, tall_narrow, "gui_13_match");
+
+        assert!(
+            texts_match.iter().any(|(t, _, _)| t == "(一致 1 / 2 件)"),
+            "expected matched count indicator (一致 1 / 2 件)"
+        );
+        assert!(
+            texts_match.iter().any(|(t, _, _)| t == "950.0k"),
+            "matching project row (agy-monitor / 950.0k) must be visible"
+        );
+        assert!(
+            !texts_match
+                .iter()
+                .any(|(t, _, _)| t == "other-app" || t == "300.0k"),
+            "non-matching project row (other-app / 300.0k) must be hidden"
+        );
+        assert!(
+            texts_match.iter().any(|(t, _, _)| t == "Gemini 2.5 Pro"),
+            "unfiltered model breakdown row must remain visible"
+        );
+        assert!(
+            texts_match.iter().any(|(t, _, _)| t == "app"),
+            "unfiltered surface breakdown row must remain visible"
+        );
+
+        // Zero-match filter should show empty-match notice without hiding model/surface tables.
+        state.project_filter = "no-such-project".to_string();
+        let _ = run_stats_frame(&mut state, tall_narrow, "gui_13_empty_warmup");
+        let texts_empty = run_stats_frame(&mut state, tall_narrow, "gui_13_empty");
+
+        assert!(
+            texts_empty.iter().any(|(t, _, _)| t == "(一致 0 / 2 件)"),
+            "expected zero-match count indicator (一致 0 / 2 件)"
+        );
+        assert!(
+            texts_empty
+                .iter()
+                .any(|(t, _, _)| t == "一致する項目はありません"),
+            "expected empty-match notice"
+        );
+        assert!(
+            !texts_empty
+                .iter()
+                .any(|(t, _, _)| t == "agy-monitor" || t == "other-app" || t == "950.0k"),
+            "all project rows must be hidden when no project matches"
+        );
+        assert!(
+            texts_empty.iter().any(|(t, _, _)| t == "Gemini 2.5 Pro"),
+            "unfiltered model breakdown row must remain visible even when project match is 0"
+        );
+        assert!(
+            texts_empty.iter().any(|(t, _, _)| t == "app"),
+            "unfiltered surface breakdown row must remain visible even when project match is 0"
         );
     }
 }
