@@ -507,7 +507,7 @@ fn ctx_01_transcript_merge_torn_line_utf8_and_bucket_reconcile() {
     assert!(res.exact);
     assert_eq!(res.step_count, 4);
     assert_eq!(res.planner_turn_count, 2);
-    assert!(res.buckets.customization_breakdown.is_none());
+    assert!(res.buckets.customization_breakdown.is_some());
     // exact target = last_prompt (10600) + last_out (300) = 10900
     assert_eq!(res.used_tokens, 10_900);
     assert_eq!(res.buckets.active_total(), 10_900);
@@ -1887,4 +1887,419 @@ fn sess_03_summaries_db_recovers_when_lock_released_within_retry_window() {
         index.by_id.get(conv_id).map(|s| s.display_title.as_str()),
         Some("Recovered Summary")
     );
+}
+
+#[test]
+fn ctx_04_customization_breakdown_populates_and_reconciles_exact_total() {
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    let conv_id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    let logs = app
+        .join("brain")
+        .join(conv_id)
+        .join(".system_generated")
+        .join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+
+    // Create mock MCP instructions and always-on rules exceeding exact_target (1500)
+    let mcp_dir = gemini.join("antigravity").join("mcp").join("demo-mcp");
+    std::fs::create_dir_all(&mcp_dir).unwrap();
+    let long_instructions = "instruction ".repeat(800);
+    std::fs::write(mcp_dir.join("instructions.md"), long_instructions).unwrap();
+
+    let rules_dir = gemini
+        .join("config")
+        .join("plugins")
+        .join("demo-plugin")
+        .join("rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    let long_rules = "rule ".repeat(800);
+    std::fs::write(rules_dir.join("always.md"), long_rules).unwrap();
+
+    let compact_lines = [
+        r#"{"step_index":0,"type":"USER_INPUT","content":"hello"}"#,
+        r#"{"step_index":1,"type":"PLANNER_RESPONSE","input_tokens":500,"cache_read_tokens":800,"output_tokens":200,"content":"ok"}"#,
+    ]
+    .join("\n")
+        + "\n";
+    std::fs::write(logs.join("transcript.jsonl"), compact_lines).unwrap();
+
+    let res = analyze_conversation(&app, conv_id, None, None).unwrap();
+    assert!(res.found);
+    assert!(res.exact);
+    assert!(res.buckets.customization_breakdown.is_some());
+    assert_eq!(res.used_tokens, 1500);
+    assert_eq!(res.buckets.active_total(), 1500);
+    assert_eq!(
+        res.buckets.agent_replies, 200,
+        "measured output tokens must not be displaced by oversized customization estimates"
+    );
+
+    // When exact_target is large enough, customization breakdown values are preserved non-zero
+    let large_lines = [
+        r#"{"step_index":0,"type":"USER_INPUT","content":"hello"}"#,
+        r#"{"step_index":1,"type":"PLANNER_RESPONSE","input_tokens":50000,"cache_read_tokens":10000,"output_tokens":500,"content":"ok"}"#,
+    ]
+    .join("\n")
+        + "\n";
+    std::fs::write(logs.join("transcript.jsonl"), large_lines).unwrap();
+    let res_large = analyze_conversation(&app, conv_id, None, None).unwrap();
+    let bd = res_large
+        .buckets
+        .customization_breakdown
+        .as_ref()
+        .expect("customization_breakdown should be populated");
+    assert!(bd.mcp_instructions > 0);
+    assert!(bd.rules_files > 0);
+    assert_eq!(res_large.used_tokens, 60_500);
+    assert_eq!(res_large.buckets.active_total(), 60_500);
+}
+
+#[test]
+fn mon_07_async_usage_and_customizations_refresh_and_drop_join() {
+    use agy_core::monitor::{MonitorCommand, MonitorConfig, MonitorHandle};
+    use agy_core::usage::UsagePeriod;
+
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    let conv_id = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    let logs = app
+        .join("brain")
+        .join(conv_id)
+        .join(".system_generated")
+        .join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+    let compact_lines = format!(
+        "{{\"step_index\":0,\"type\":\"USER_INPUT\",\"created_at\":\"{now_rfc3339}\",\"content\":\"hi\"}}\n\
+         {{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"{now_rfc3339}\",\"input_tokens\":400,\"cache_read_tokens\":1600,\"output_tokens\":150,\"content\":\"done\"}}\n"
+    );
+    std::fs::write(logs.join("transcript.jsonl"), compact_lines).unwrap();
+
+    let rules_dir = gemini
+        .join("config")
+        .join("plugins")
+        .join("test-plugin")
+        .join("rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    std::fs::write(rules_dir.join("base.md"), "Always apply this rule.\n").unwrap();
+
+    let sum_db = app.join("conversation_summaries.db");
+    let conn = Connection::open_with_flags(
+        &sum_db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE conversation_summaries (
+            conversation_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            preview TEXT NOT NULL DEFAULT '',
+            workspace_uris TEXT NOT NULL DEFAULT '',
+            project_id TEXT NOT NULL DEFAULT '',
+            agent_name TEXT NOT NULL DEFAULT '',
+            parent_conversation_id TEXT NOT NULL DEFAULT '',
+            nesting_depth INTEGER NOT NULL DEFAULT 0,
+            last_modified_time TEXT NOT NULL DEFAULT ''
+        );",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO conversation_summaries VALUES (?1, ?2, '', '', '', '', '', 0, ?3)",
+        rusqlite::params![conv_id, "Phase 2 Monitor Test", now_rfc3339],
+    )
+    .unwrap();
+    drop(conn);
+
+    let cfg = MonitorConfig::new(GeminiPaths::from_gemini_dir(&gemini));
+    let handle = MonitorHandle::start(cfg);
+
+    // Explicitly trigger async customization scan and verify snapshot update
+    handle.send(MonitorCommand::RefreshCustomizations);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let s = handle.snapshot();
+        if s.customizations.is_some() && !s.customizations_loading {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let snap_custom = handle.snapshot();
+    assert!(
+        snap_custom.customizations.is_some(),
+        "startup customization inventory should populate asynchronously"
+    );
+
+    handle.send(MonitorCommand::RefreshUsage(UsagePeriod::AllTime));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let s = handle.snapshot();
+        if s.usage_report.is_some() && !s.usage_loading {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let snap_usage = handle.snapshot();
+    let rep = snap_usage
+        .usage_report
+        .expect("RefreshUsage must populate usage_report");
+    assert_eq!(rep.analyzed_sessions, 1);
+    assert_eq!(rep.total_input_tokens, 2000);
+    assert_eq!(rep.total_cached_tokens, 1600);
+    assert_eq!(rep.total_output_tokens, 150);
+
+    // Drop must cancel and join both worker threads promptly
+    let drop_start = Instant::now();
+    drop(handle);
+    assert!(
+        drop_start.elapsed() < Duration::from_secs(2),
+        "MonitorHandle::drop took too long: {:?}",
+        drop_start.elapsed()
+    );
+}
+
+#[test]
+fn mon_08_refresh_now_and_rescan_update_realtime_customization_breakdown() {
+    use agy_core::monitor::{MonitorCommand, MonitorConfig, MonitorHandle};
+
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    let conv_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    let logs = app
+        .join("brain")
+        .join(conv_id)
+        .join(".system_generated")
+        .join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+
+    let compact_lines = [
+        r#"{"step_index":0,"type":"USER_INPUT","content":"hello"}"#,
+        r#"{"step_index":1,"type":"PLANNER_RESPONSE","input_tokens":40000,"cache_read_tokens":10000,"output_tokens":300,"content":"ok"}"#,
+    ]
+    .join("\n")
+        + "\n";
+    std::fs::write(logs.join("transcript.jsonl"), compact_lines).unwrap();
+
+    let rules_dir = gemini
+        .join("config")
+        .join("plugins")
+        .join("p-refresh")
+        .join("rules");
+    std::fs::create_dir_all(&rules_dir).unwrap();
+    let rule_path = rules_dir.join("always.md");
+    std::fs::write(&rule_path, "rule ".repeat(50)).unwrap();
+
+    let sum_db = app.join("conversation_summaries.db");
+    let conn = Connection::open_with_flags(
+        &sum_db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE conversation_summaries (
+            conversation_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            preview TEXT NOT NULL DEFAULT '',
+            workspace_uris TEXT NOT NULL DEFAULT '',
+            project_id TEXT NOT NULL DEFAULT '',
+            agent_name TEXT NOT NULL DEFAULT '',
+            parent_conversation_id TEXT NOT NULL DEFAULT '',
+            nesting_depth INTEGER NOT NULL DEFAULT 0,
+            last_modified_time TEXT NOT NULL DEFAULT ''
+        );",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO conversation_summaries VALUES (?1, ?2, '', '', '', '', '', 0, '2026-11-24 10:00:00+00:00')",
+        rusqlite::params![conv_id, "Refresh Breakdown Test"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut cfg = MonitorConfig::new(GeminiPaths::from_gemini_dir(&gemini));
+    cfg.poll_interval = Duration::from_secs(60);
+    let handle = MonitorHandle::start(cfg);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if handle.snapshot().analysis.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let initial_rules = handle
+        .snapshot()
+        .analysis
+        .unwrap()
+        .buckets
+        .customization_breakdown
+        .unwrap()
+        .rules_files;
+    assert!(initial_rules > 0);
+
+    // Grow the rule file without touching conversation transcript/DB, then RefreshNow
+    std::fs::write(&rule_path, "rule ".repeat(300)).unwrap();
+    handle.send(MonitorCommand::RefreshNow);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut after_refresh_now = initial_rules;
+    while Instant::now() < deadline {
+        if let Some(a) = handle.snapshot().analysis {
+            let v = a.buckets.customization_breakdown.unwrap().rules_files;
+            if v > initial_rules {
+                after_refresh_now = v;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        after_refresh_now > initial_rules,
+        "RefreshNow must refresh realtime customization_breakdown"
+    );
+
+    // Remove the rule file while paused, then RefreshCustomizations must update realtime analysis
+    handle.send(MonitorCommand::SetPaused(true));
+    std::fs::remove_file(&rule_path).unwrap();
+    handle.send(MonitorCommand::RefreshCustomizations);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut after_rescan = after_refresh_now;
+    while Instant::now() < deadline {
+        let s = handle.snapshot();
+        if !s.customizations_loading
+            && let Some(a) = s.analysis
+        {
+            let v = a.buckets.customization_breakdown.unwrap().rules_files;
+            if v == 0 {
+                after_rescan = v;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        after_rescan, 0,
+        "RefreshCustomizations must invalidate cached analysis and update realtime customization_breakdown"
+    );
+
+    drop(handle);
+}
+
+#[test]
+fn mon_09_refresh_usage_while_paused_includes_new_session() {
+    use agy_core::monitor::{MonitorCommand, MonitorConfig, MonitorHandle};
+    use agy_core::usage::UsagePeriod;
+
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    let conv_1 = "11111111-1111-1111-1111-111111111119";
+    let conv_2 = "22222222-2222-2222-2222-222222222229";
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+
+    let logs_1 = app
+        .join("brain")
+        .join(conv_1)
+        .join(".system_generated")
+        .join("logs");
+    std::fs::create_dir_all(&logs_1).unwrap();
+    std::fs::write(
+        logs_1.join("transcript.jsonl"),
+        format!(
+            "{{\"step_index\":0,\"type\":\"USER_INPUT\",\"created_at\":\"{now_rfc3339}\",\"content\":\"s1\"}}\n\
+             {{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"{now_rfc3339}\",\"input_tokens\":100,\"cache_read_tokens\":200,\"output_tokens\":50,\"content\":\"r1\"}}\n"
+        ),
+    )
+    .unwrap();
+
+    let sum_db = app.join("conversation_summaries.db");
+    let conn = Connection::open_with_flags(
+        &sum_db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE conversation_summaries (
+            conversation_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            preview TEXT NOT NULL DEFAULT '',
+            workspace_uris TEXT NOT NULL DEFAULT '',
+            project_id TEXT NOT NULL DEFAULT '',
+            agent_name TEXT NOT NULL DEFAULT '',
+            parent_conversation_id TEXT NOT NULL DEFAULT '',
+            nesting_depth INTEGER NOT NULL DEFAULT 0,
+            last_modified_time TEXT NOT NULL DEFAULT ''
+        );",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO conversation_summaries VALUES (?1, 'First', '', '', '', '', '', 0, ?2)",
+        rusqlite::params![conv_1, now_rfc3339],
+    )
+    .unwrap();
+
+    let mut cfg = MonitorConfig::new(GeminiPaths::from_gemini_dir(&gemini));
+    cfg.poll_interval = Duration::from_secs(60);
+    let handle = MonitorHandle::start(cfg);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !handle.snapshot().index.by_id.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    handle.send(MonitorCommand::SetPaused(true));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if handle.snapshot().paused {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Add a second conversation while paused
+    let logs_2 = app
+        .join("brain")
+        .join(conv_2)
+        .join(".system_generated")
+        .join("logs");
+    std::fs::create_dir_all(&logs_2).unwrap();
+    std::fs::write(
+        logs_2.join("transcript.jsonl"),
+        format!(
+            "{{\"step_index\":0,\"type\":\"USER_INPUT\",\"created_at\":\"{now_rfc3339}\",\"content\":\"s2\"}}\n\
+             {{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"{now_rfc3339}\",\"input_tokens\":300,\"cache_read_tokens\":400,\"output_tokens\":80,\"content\":\"r2\"}}\n"
+        ),
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO conversation_summaries VALUES (?1, 'Second', '', '', '', '', '', 0, ?2)",
+        rusqlite::params![conv_2, now_rfc3339],
+    )
+    .unwrap();
+    drop(conn);
+
+    handle.send(MonitorCommand::RefreshUsage(UsagePeriod::AllTime));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let s = handle.snapshot();
+        if s.usage_report.is_some() && !s.usage_loading {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let rep = handle
+        .snapshot()
+        .usage_report
+        .expect("RefreshUsage while paused should finish");
+    assert_eq!(rep.analyzed_sessions, 2);
+    assert_eq!(rep.total_input_tokens, 1000);
+    assert_eq!(rep.total_output_tokens, 130);
+
+    drop(handle);
 }
