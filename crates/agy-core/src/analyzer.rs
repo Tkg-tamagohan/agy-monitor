@@ -132,6 +132,75 @@ pub struct CustomizationBreakdown {
     pub rules_deferred: u64,
 }
 
+fn custom_always_sum(breakdown: &CustomizationBreakdown) -> u64 {
+    breakdown.mcp_tools
+        + breakdown.mcp_instructions
+        + breakdown.rules_files
+        + breakdown.skills_index
+        + breakdown.custom_agents
+}
+
+/// Proportionally scales the 5 always-loaded fields of `breakdown` so their sum
+/// equals `budget` when `custom_always_sum(breakdown) > budget`. Deferred fields
+/// are left untouched. Returns the resulting always-loaded sum.
+fn scale_customization_always_to_budget(
+    breakdown: &mut CustomizationBreakdown,
+    budget: u64,
+) -> u64 {
+    let total = custom_always_sum(breakdown);
+    if total <= budget || total == 0 {
+        return total;
+    }
+
+    let fields: [&mut u64; 5] = [
+        &mut breakdown.mcp_tools,
+        &mut breakdown.mcp_instructions,
+        &mut breakdown.rules_files,
+        &mut breakdown.skills_index,
+        &mut breakdown.custom_agents,
+    ];
+
+    let total_u128 = total as u128;
+    let budget_u128 = budget as u128;
+    let mut floored = [0u64; 5];
+    let mut remainders = [(0u128, 0usize); 5];
+    let mut floored_sum: u64 = 0;
+
+    for (idx, field) in fields.iter().enumerate() {
+        let orig = **field;
+        if orig == 0 {
+            remainders[idx] = (0, idx);
+            continue;
+        }
+        let numerator = (orig as u128) * budget_u128;
+        let q = (numerator / total_u128) as u64;
+        let r = numerator % total_u128;
+        floored[idx] = q;
+        floored_sum += q;
+        remainders[idx] = (r, idx);
+    }
+
+    let mut leftover = budget.saturating_sub(floored_sum);
+    if leftover > 0 {
+        remainders.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        for (rem, idx) in remainders {
+            if leftover == 0 {
+                break;
+            }
+            if *fields[idx] > 0 && rem > 0 {
+                floored[idx] += 1;
+                leftover -= 1;
+            }
+        }
+    }
+
+    for (idx, field) in fields.into_iter().enumerate() {
+        *field = floored[idx];
+    }
+
+    custom_always_sum(breakdown)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ContextBuckets {
     pub user_messages: u64,
@@ -144,7 +213,7 @@ pub struct ContextBuckets {
     pub system_messages: u64,
     pub checkpoint_buffer: u64,
     pub free_space: u64,
-    /// Reserved for Phase 2 customization/MCP breakdown. Always `None` in Phase 1.
+    /// Phase 2 customization/MCP breakdown (populated when available).
     pub customization_breakdown: Option<CustomizationBreakdown>,
 }
 
@@ -153,9 +222,7 @@ impl ContextBuckets {
         let custom_sum = self
             .customization_breakdown
             .as_ref()
-            .map(|c| {
-                c.mcp_tools + c.mcp_instructions + c.rules_files + c.skills_index + c.custom_agents
-            })
+            .map(custom_always_sum)
             .unwrap_or(0);
         self.user_messages
             + self.agent_replies
@@ -325,6 +392,26 @@ pub fn reconcile_active_buckets(buckets: &mut ContextBuckets, target_total: u64)
         *slot -= take;
         remaining -= take;
     }
+
+    if remaining > 0
+        && let Some(custom) = buckets.customization_breakdown.as_mut()
+    {
+        let custom_fields: [&mut u64; 5] = [
+            &mut custom.custom_agents,
+            &mut custom.skills_index,
+            &mut custom.rules_files,
+            &mut custom.mcp_instructions,
+            &mut custom.mcp_tools,
+        ];
+        for slot in custom_fields {
+            if remaining == 0 {
+                break;
+            }
+            let take = (*slot).min(remaining);
+            *slot -= take;
+            remaining -= take;
+        }
+    }
 }
 
 pub fn analyze_conversation(
@@ -342,6 +429,22 @@ pub(crate) fn analyze_conversation_with_meta(
     conv_id: &str,
     explicit_context_limit: Option<u64>,
     pbtxt_override: Option<&Path>,
+) -> std::result::Result<(ConversationAnalysis, bool), CoreError> {
+    analyze_conversation_with_meta_and_customizations(
+        app_data,
+        conv_id,
+        explicit_context_limit,
+        pbtxt_override,
+        None,
+    )
+}
+
+pub(crate) fn analyze_conversation_with_meta_and_customizations(
+    app_data: &Path,
+    conv_id: &str,
+    explicit_context_limit: Option<u64>,
+    pbtxt_override: Option<&Path>,
+    customization_breakdown: Option<CustomizationBreakdown>,
 ) -> std::result::Result<(ConversationAnalysis, bool), CoreError> {
     if !is_valid_conv_id(conv_id) {
         return Err(CoreError::InvalidConversationId(conv_id.to_string()));
@@ -592,18 +695,38 @@ pub(crate) fn analyze_conversation_with_meta(
     let first_sys_msg_tokens = pre_steps_clamped.saturating_sub(first_user_tokens);
     let raw_fixed_baseline = first_prompt.saturating_sub(pre_steps_clamped);
 
-    let (system_tools_base, system_prompt_base) = if raw_fixed_baseline > 0 {
+    let mut resolved_breakdown = customization_breakdown.unwrap_or_else(|| {
+        app_data
+            .parent()
+            .map(|gemini_dir| {
+                crate::customizations::scan_customizations(
+                    &crate::paths::GeminiPaths::from_gemini_dir(gemini_dir),
+                )
+                .breakdown
+            })
+            .unwrap_or_default()
+    });
+
+    let (mut system_tools_base, mut system_prompt_base) = if raw_fixed_baseline > 0 {
         let st = ((raw_fixed_baseline as f64 * 0.42).round() as u64).min(9500);
         let sp = raw_fixed_baseline.saturating_sub(st);
         (st, sp)
     } else {
         (4800, 5200)
     };
+    let fixed_baseline_budget = system_tools_base + system_prompt_base;
+    let scaled_custom_sum =
+        scale_customization_always_to_budget(&mut resolved_breakdown, fixed_baseline_budget);
+
+    let deduct_sp = system_prompt_base.min(scaled_custom_sum);
+    system_prompt_base -= deduct_sp;
+    let deduct_st = system_tools_base.min(scaled_custom_sum - deduct_sp);
+    system_tools_base -= deduct_st;
 
     let mut buckets = ContextBuckets {
         system_tools: system_tools_base,
         system_prompt: system_prompt_base,
-        customization_breakdown: None,
+        customization_breakdown: Some(resolved_breakdown),
         ..Default::default()
     };
 
@@ -617,7 +740,7 @@ pub(crate) fn analyze_conversation_with_meta(
         cumulative_output_tokens += steps[idx].output_tokens.unwrap_or(0);
     }
 
-    let fixed_baseline_sum = buckets.system_tools + buckets.system_prompt;
+    let fixed_baseline_sum = buckets.system_tools + buckets.system_prompt + scaled_custom_sum;
     for cp in &mut compactions {
         if cp.after_tokens.is_none() {
             let after = fixed_baseline_sum + cp.summary_tokens;
@@ -680,13 +803,30 @@ pub(crate) fn analyze_conversation_with_meta(
             buckets.user_messages = first_user_tokens;
             buckets.system_messages = first_sys_msg_tokens;
         } else {
+            let current_custom = buckets
+                .customization_breakdown
+                .as_ref()
+                .map(custom_always_sum)
+                .unwrap_or(0);
             let max_fixed = (anchor_prompt as f64 * 0.85) as u64;
             if fixed_baseline_sum > max_fixed && fixed_baseline_sum > 0 {
                 let s = (anchor_prompt as f64 * 0.85) / fixed_baseline_sum as f64;
                 buckets.system_tools = (buckets.system_tools as f64 * s).round() as u64;
                 buckets.system_prompt = (buckets.system_prompt as f64 * s).round() as u64;
+                if let Some(custom) = buckets.customization_breakdown.as_mut() {
+                    custom.mcp_tools = (custom.mcp_tools as f64 * s).round() as u64;
+                    custom.mcp_instructions = (custom.mcp_instructions as f64 * s).round() as u64;
+                    custom.rules_files = (custom.rules_files as f64 * s).round() as u64;
+                    custom.skills_index = (custom.skills_index as f64 * s).round() as u64;
+                    custom.custom_agents = (custom.custom_agents as f64 * s).round() as u64;
+                }
             }
-            let adjusted_fixed = buckets.system_tools + buckets.system_prompt;
+            let adjusted_custom = buckets
+                .customization_breakdown
+                .as_ref()
+                .map(custom_always_sum)
+                .unwrap_or(current_custom);
+            let adjusted_fixed = buckets.system_tools + buckets.system_prompt + adjusted_custom;
             let available_post_fixed = anchor_prompt.saturating_sub(adjusted_fixed);
 
             let cp_idx = last_compaction_step_idx.unwrap_or(0);
@@ -1143,4 +1283,153 @@ fn find_first_uuid(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn ctx_05_scale_customization_always_to_budget_is_deterministic_and_exact() {
+        let mut within = CustomizationBreakdown {
+            mcp_tools: 100,
+            mcp_instructions: 200,
+            rules_files: 300,
+            skills_index: 50,
+            custom_agents: 50,
+            mcp_deferred: 111,
+            skills_deferred: 222,
+            rules_deferred: 333,
+        };
+        assert_eq!(scale_customization_always_to_budget(&mut within, 1000), 700);
+        assert_eq!(within.mcp_tools, 100);
+        assert_eq!(within.mcp_deferred, 111);
+
+        let mut oversized = CustomizationBreakdown {
+            mcp_tools: 1000,
+            mcp_instructions: 2000,
+            rules_files: 3000,
+            skills_index: 0,
+            custom_agents: 1500,
+            mcp_deferred: 444,
+            skills_deferred: 555,
+            rules_deferred: 666,
+        };
+        let budget = 1001;
+        let scaled_sum = scale_customization_always_to_budget(&mut oversized, budget);
+        assert_eq!(scaled_sum, budget);
+        assert_eq!(custom_always_sum(&oversized), budget);
+        assert_eq!(oversized.skills_index, 0);
+        assert_eq!(oversized.mcp_deferred, 444);
+        assert_eq!(oversized.skills_deferred, 555);
+        assert_eq!(oversized.rules_deferred, 666);
+
+        let mut tiny_budget = CustomizationBreakdown {
+            mcp_tools: 100,
+            mcp_instructions: 100,
+            rules_files: 100,
+            skills_index: 100,
+            custom_agents: 100,
+            mcp_deferred: 77,
+            skills_deferred: 88,
+            rules_deferred: 99,
+        };
+        assert_eq!(scale_customization_always_to_budget(&mut tiny_budget, 3), 3);
+        assert_eq!(custom_always_sum(&tiny_budget), 3);
+        assert_eq!(tiny_budget.mcp_deferred, 77);
+        assert_eq!(tiny_budget.skills_deferred, 88);
+        assert_eq!(tiny_budget.rules_deferred, 99);
+
+        assert_eq!(scale_customization_always_to_budget(&mut tiny_budget, 0), 0);
+        assert_eq!(custom_always_sum(&tiny_budget), 0);
+        assert_eq!(tiny_budget.mcp_deferred, 77);
+    }
+
+    #[test]
+    fn ctx_06_oversized_customizations_preserve_agent_replies_and_user_messages() {
+        let tmp = TempDir::new().unwrap();
+        let gemini = tmp.path().join(".gemini");
+        let app = gemini.join("antigravity");
+        let conv_id = "abababab-abab-abab-abab-abababababab";
+        let logs = app
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+
+        let mcp_dir = app.join("mcp").join("demo-mcp");
+        std::fs::create_dir_all(&mcp_dir).unwrap();
+        std::fs::write(mcp_dir.join("instructions.md"), "instruction ".repeat(1000)).unwrap();
+
+        let rules_dir = gemini
+            .join("config")
+            .join("plugins")
+            .join("demo-plugin")
+            .join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(rules_dir.join("always.md"), "rule ".repeat(1000)).unwrap();
+
+        let compact_lines = [
+            r#"{"step_index":0,"type":"USER_INPUT","content":"hello"}"#,
+            r#"{"step_index":1,"type":"PLANNER_RESPONSE","input_tokens":500,"cache_read_tokens":800,"output_tokens":200,"content":"ok"}"#,
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(logs.join("transcript.jsonl"), compact_lines).unwrap();
+
+        // 1. Disk-scanned oversized customizations must not erase agent_replies or user_messages.
+        let disk_res = analyze_conversation(&app, conv_id, None, None).unwrap();
+        assert_eq!(disk_res.used_tokens, 1500);
+        assert_eq!(disk_res.buckets.active_total(), 1500);
+        assert_eq!(disk_res.buckets.agent_replies, 200);
+        assert!(disk_res.buckets.user_messages > 0);
+        assert_eq!(disk_res.buckets.system_tools, 0);
+        assert_eq!(disk_res.buckets.system_prompt, 0);
+        let disk_bd = disk_res
+            .buckets
+            .customization_breakdown
+            .as_ref()
+            .expect("customization_breakdown should be populated");
+        assert!(disk_bd.mcp_instructions > 0);
+        assert!(disk_bd.rules_files > 0);
+        assert_eq!(
+            custom_always_sum(disk_bd)
+                + disk_res.buckets.user_messages
+                + disk_res.buckets.agent_replies,
+            1500
+        );
+
+        // 2. Explicit breakdown with deferred fields leaves deferred fields untouched.
+        let explicit = CustomizationBreakdown {
+            mcp_tools: 3000,
+            mcp_instructions: 2000,
+            rules_files: 1000,
+            skills_index: 500,
+            custom_agents: 500,
+            mcp_deferred: 123,
+            skills_deferred: 456,
+            rules_deferred: 789,
+        };
+        let (explicit_res, _) = analyze_conversation_with_meta_and_customizations(
+            &app,
+            conv_id,
+            None,
+            None,
+            Some(explicit),
+        )
+        .unwrap();
+        assert_eq!(explicit_res.buckets.agent_replies, 200);
+        assert!(explicit_res.buckets.user_messages > 0);
+        assert_eq!(explicit_res.buckets.active_total(), 1500);
+        let explicit_bd = explicit_res
+            .buckets
+            .customization_breakdown
+            .as_ref()
+            .unwrap();
+        assert_eq!(explicit_bd.mcp_deferred, 123);
+        assert_eq!(explicit_bd.skills_deferred, 456);
+        assert_eq!(explicit_bd.rules_deferred, 789);
+    }
 }

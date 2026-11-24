@@ -3,6 +3,7 @@
 mod app;
 mod fonts;
 mod theme;
+mod usage_view;
 
 use agy_core::paths::GeminiPaths;
 use eframe::egui;

@@ -12,7 +12,7 @@
 - **セッション一覧と検索**：サイドバーでプロジェクト絞り込みやキーワード検索（短縮モデル名を含む）を行い、会話ごとの利用モデルと状態を確認できる。
   手動で会話を選択すると自動追従が解除され、トップバーの「最新追従」から再度有効化できる。
 - **表示とウィンドウ操作**：通常表示（初期サイズ `1240x820`、最小 `760x520`）とコンパクト HUD（`380x170`）の切替、最前面固定、ダークとライトのテーマ切替、監視の一時停止と手動更新を備える。
-- **未実装タブ（Phase 2 予定）**：トップバーに「期間統計 (Phase 2)」タブを配置しているものの、期間統計、カスタマイズと MCP 棚卸しの実装は Phase 2 予定のためプレースホルダ表示にとどまる。
+- **期間統計と棚卸しタブ（Phase 2）**：トップバーの「期間統計・棚卸し」タブから、期間別統計（今日、7 日間、30 日間、全期間、ローカル日付の会話最終更新日を基準としたセッション累計、最大 500 件の安全上限付き）と日別推移グラフ、モデルやプロジェクトやサーフェスごとの集計、および `~/.gemini/` 配下のカスタマイズと MCP の棚卸し（常時読込と遅延読込の内訳、キーワードと種別フィルタ）をオンデマンドで集計して表示できる。
 
 ## 動作環境と起動方法
 
@@ -33,14 +33,15 @@ cargo run --release -p agy-gui --bin agy-monitor
 
 `~/.gemini/` 配下のデータベースおよびログファイルへは一切書き込まない。
 SQLite ファイル（`conversation_summaries.db`、`conversations/<conv_id>.db`）はすべて `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX`、`PRAGMA query_only = ON`、ビジータイムアウト（150ms）で開く。
-`conversation_summaries.db` の一覧取得と選択中セッションの解析（`detect_conversation_model`）では、ビジーまたはロックエラーが伝播した際に共通の再試行処理（30ms、80ms、160ms のバックオフ）を行う。
+`conversation_summaries.db` の一覧取得、選択中セッションの解析（`detect_conversation_model`）、および期間統計の集計における各セッション解析では、ビジーまたはロックエラーが伝播した際に共通の再試行処理（30ms、80ms、160ms のバックオフ）を行う。
 一方、サイドバーの一覧表示で使う軽量なモデル名取得（`detect_conversation_model_label_from_db`）では再試行を行わず、ビジー時はその周期をスキップする。
 会話ログ（`transcript_full.jsonl`、`transcript.jsonl`）と状態ファイル（`antigravity_state.pbtxt`）も読み取り専用で参照する。
+カスタマイズと MCP の棚卸しでは `~/.gemini/` 配下（`antigravity/mcp/`、`antigravity/builtin/skills/`、`antigravity/mcp_config.json`、`config/plugins/`、`config/mcp_config.json`）のみを読み取り専用で走査し、設定ファイルに含まれる認証トークンや環境変数などの秘密値は保持せず表示もしない。
 
 ## リポジトリ構成
 
-- `crates/agy-core`：パス解決、SQLite 読み取り、会話ログ解析、モデル判定、バックグラウンド監視ワーカーを担うコアライブラリ。
-- `crates/agy-gui`：`eframe` と `egui_plot` によるネイティブ GUI、日本語フォント設定、バイナリ `agy-monitor` を含むフロントエンドクレート。
+- `crates/agy-core`：パス解決、SQLite 読み取り、会話ログ解析、モデル判定、期間統計集計、カスタマイズ棚卸し、バックグラウンド監視ワーカーを担うコアライブラリ。
+- `crates/agy-gui`：`eframe` と `egui_plot` によるネイティブ GUI（リアルタイム監視画面と Phase 2 期間統計および棚卸し画面）、日本語フォント設定、バイナリ `agy-monitor` を含むフロントエンドクレート。
 - `AGENTS.md`：リポジトリの開発規約と不変条件。
 - `.github/workflows/ci.yml`：変更検出、テキスト衛生検査（UTF-8、`U+FFFD`、マージ競合マーカー）、Windows ランナーでのフォーマット、Clippy、テスト実行を定義した GitHub Actions ワークフロー。
 
