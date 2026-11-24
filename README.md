@@ -16,7 +16,8 @@
 
 ## 動作環境と起動方法
 
-`Cargo.toml` が Rust Edition 2024 を指定しているため、ビルドには Rust 1.85 以降のツールチェーンが必要になる。
+本リポジトリは Rust Edition 2024 と `let` チェーン構文（Rust 1.88 以降）および最新系クレートを使用しており、`Cargo.toml` で MSRV（`rust-version`）は固定していない。
+ビルドには最新の stable Rust ツールチェーン（CI は `dtolnay/rust-toolchain@stable`、ローカルでの動作確認済み環境は Windows 上の Rust 1.100.0）を利用する。
 日本語表示では Windows 標準フォント（`BIZ-UDGothicR.ttc`、`meiryo.ttc`、`NotoSansJP-VF.ttf`、`YuGothM.ttc`、`msgothic.ttc` の優先順）をフォールバックとして読み込む設計上、現時点の主対象環境と CI 検証対象は Windows である。
 
 ビルドと起動には次のコマンドを実行する。
@@ -31,7 +32,9 @@ cargo run --release -p agy-gui --bin agy-monitor
 ## 読み取り専用アクセスと対象データ
 
 `~/.gemini/` 配下のデータベースおよびログファイルへは一切書き込まない。
-SQLite ファイル（`conversation_summaries.db`、`conversations/<conv_id>.db`）は `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX` と `PRAGMA query_only = ON` で開き、ビジータイムアウト（150ms）とバックオフ付きリトライ（30ms、80ms、160ms）で他プロセスとの競合を吸収する。
+SQLite ファイル（`conversation_summaries.db`、`conversations/<conv_id>.db`）はすべて `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX`、`PRAGMA query_only = ON`、ビジータイムアウト（150ms）で開く。
+他プロセスとの競合に対するバックオフ付き再試行（30ms、80ms、160ms）は、`conversation_summaries.db` の一覧取得と選択中セッションの解析（`conversations/<conv_id>.db`）に適用する。
+サイドバーの一覧表示で使う軽量なモデル名取得では再試行を行わず、ビジー時はその周期をスキップして次回ポールへ回す。
 会話ログ（`transcript_full.jsonl`、`transcript.jsonl`）と状態ファイル（`antigravity_state.pbtxt`）も読み取り専用で参照する。
 
 ## リポジトリ構成
