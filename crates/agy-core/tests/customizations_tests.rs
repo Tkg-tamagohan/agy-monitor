@@ -300,8 +300,8 @@ fn cust_02_secrets_never_appear_in_inventory_or_warnings() {
     let secrets = [
         "SUPER_SECRET_ENV_VALUE_XYZ123",
         "Bearer_TOP_SECRET_AUTH_HEADER_999",
-        "AIzaSyFAKE_API_KEY_DO_NOT_LEAK",
-        "ghp_SECRET_TOKEN_VALUE_777",
+        "DUMMY_API_KEY_VALUE_DO_NOT_LEAK",
+        "DUMMY_TOKEN_VALUE_777",
         "hunter2_SECRET_PASSWORD_000",
         "RAW_JSON_SNIPPET_MARKER_DO_NOT_APPEAR",
     ];
