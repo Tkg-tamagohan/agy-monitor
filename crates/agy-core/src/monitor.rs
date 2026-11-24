@@ -94,10 +94,16 @@ struct AnalysisCacheKey {
     transcript_fp: TranscriptFingerprint,
     db_fp: DbFingerprint,
     pbtxt_fp: FileStamp,
+    breakdown_version: u64,
+}
+
+enum PollerMsg {
+    Public(MonitorCommand),
+    BreakdownUpdated,
 }
 
 pub struct MonitorHandle {
-    tx: Sender<MonitorCommand>,
+    tx: Sender<PollerMsg>,
     phase2_tx: Sender<Phase2Cmd>,
     shutdown_flag: Arc<AtomicBool>,
     usage_cancel: Arc<Mutex<Arc<AtomicBool>>>,
@@ -138,14 +144,16 @@ impl MonitorHandle {
         let usage_cancel = Arc::new(Mutex::new(Arc::new(AtomicBool::new(false))));
         let custom_cancel = Arc::new(Mutex::new(Arc::new(AtomicBool::new(false))));
         let latest_breakdown = Arc::new(Mutex::new(None::<CustomizationBreakdown>));
+        let breakdown_version = Arc::new(AtomicU64::new(0));
         let latest_index = Arc::new(Mutex::new(None::<SessionIndex>));
         let usage_gen = Arc::new(AtomicU64::new(0));
         let custom_gen = Arc::new(AtomicU64::new(0));
 
-        let (tx, rx) = mpsc::channel::<MonitorCommand>();
+        let (tx, rx) = mpsc::channel::<PollerMsg>();
         let (phase2_tx, phase2_rx) = mpsc::channel::<Phase2Cmd>();
 
         let poller_breakdown = Arc::clone(&latest_breakdown);
+        let poller_breakdown_version = Arc::clone(&breakdown_version);
         let poller_index = Arc::clone(&latest_index);
         let poller_phase2_tx = phase2_tx.clone();
         let poller_shutdown = Arc::clone(&shutdown_flag);
@@ -166,6 +174,7 @@ impl MonitorHandle {
                     reload_count_clone,
                     scan_count_clone,
                     poller_breakdown,
+                    poller_breakdown_version,
                     poller_index,
                     poller_phase2_tx,
                     poller_shutdown,
@@ -179,6 +188,8 @@ impl MonitorHandle {
 
         let p2_snap = Arc::clone(&snapshot);
         let p2_breakdown = Arc::clone(&latest_breakdown);
+        let p2_breakdown_version = Arc::clone(&breakdown_version);
+        let p2_poller_tx = tx.clone();
         let p2_index = Arc::clone(&latest_index);
         let p2_shutdown = Arc::clone(&shutdown_flag);
         let phase2_thread = thread::Builder::new()
@@ -188,8 +199,10 @@ impl MonitorHandle {
                     poller_config_paths,
                     poller_notify,
                     phase2_rx,
+                    p2_poller_tx,
                     p2_snap,
                     p2_breakdown,
+                    p2_breakdown_version,
                     p2_index,
                     p2_shutdown,
                     usage_gen,
@@ -216,7 +229,7 @@ impl MonitorHandle {
         if matches!(cmd, MonitorCommand::Shutdown) {
             self.signal_cancel_all();
         }
-        let _ = self.tx.send(cmd);
+        let _ = self.tx.send(PollerMsg::Public(cmd));
     }
 
     fn signal_cancel_all(&self) {
@@ -246,7 +259,7 @@ impl MonitorHandle {
 impl Drop for MonitorHandle {
     fn drop(&mut self) {
         self.signal_cancel_all();
-        let _ = self.tx.send(MonitorCommand::Shutdown);
+        let _ = self.tx.send(PollerMsg::Public(MonitorCommand::Shutdown));
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -259,11 +272,12 @@ impl Drop for MonitorHandle {
 #[allow(clippy::too_many_arguments)]
 fn run_poller(
     config: MonitorConfig,
-    rx: mpsc::Receiver<MonitorCommand>,
+    rx: mpsc::Receiver<PollerMsg>,
     snapshot: Arc<Mutex<MonitorSnapshot>>,
     index_reload_count: Arc<AtomicU64>,
     model_scan_count: Arc<AtomicU64>,
     latest_breakdown: Arc<Mutex<Option<CustomizationBreakdown>>>,
+    breakdown_version: Arc<AtomicU64>,
     latest_index: Arc<Mutex<Option<SessionIndex>>>,
     phase2_tx: Sender<Phase2Cmd>,
     shutdown_flag: Arc<AtomicBool>,
@@ -297,9 +311,11 @@ fn run_poller(
         &mut busy_this_poll,
         paused,
         false,
+        false,
         &index_reload_count,
         &model_scan_count,
         &latest_breakdown,
+        &breakdown_version,
         &latest_index,
         &snapshot,
     );
@@ -322,18 +338,23 @@ fn run_poller(
             config.poll_interval
         };
         match rx.recv_timeout(wait_timeout) {
-            Ok(MonitorCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
-            Ok(cmd) => {
+            Ok(PollerMsg::Public(MonitorCommand::Shutdown))
+            | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(msg) => {
                 let mut force_reanalyze = false;
                 let mut should_poll = false;
+                let mut refresh_breakdown = false;
+                let mut reanalyze_cached = false;
                 if matches!(
-                    apply_command(
-                        cmd,
+                    apply_poller_msg(
+                        msg,
                         &mut follow_latest,
                         &mut paused,
                         &mut selected_id,
                         &mut should_poll,
                         &mut force_reanalyze,
+                        &mut refresh_breakdown,
+                        &mut reanalyze_cached,
                         &snapshot,
                         &config.notify,
                         &phase2_tx,
@@ -348,16 +369,18 @@ fn run_poller(
                     break;
                 }
 
-                // Drain any queued commands before polling.
-                while let Ok(next_cmd) = rx.try_recv() {
+                // Drain any queued messages before polling or re-analyzing.
+                while let Ok(next_msg) = rx.try_recv() {
                     if matches!(
-                        apply_command(
-                            next_cmd,
+                        apply_poller_msg(
+                            next_msg,
                             &mut follow_latest,
                             &mut paused,
                             &mut selected_id,
                             &mut should_poll,
                             &mut force_reanalyze,
+                            &mut refresh_breakdown,
+                            &mut reanalyze_cached,
                             &snapshot,
                             &config.notify,
                             &phase2_tx,
@@ -388,13 +411,28 @@ fn run_poller(
                         &mut busy_this_poll,
                         paused,
                         force_reanalyze,
+                        refresh_breakdown,
                         &index_reload_count,
                         &model_scan_count,
                         &latest_breakdown,
+                        &breakdown_version,
                         &latest_index,
                         &snapshot,
                     );
                     last_full_poll_at = Instant::now();
+                } else if reanalyze_cached {
+                    reanalyze_selected_with_cached_index(
+                        &config,
+                        selected_id.as_deref(),
+                        cached_index.as_ref(),
+                        &mut cached_key,
+                        &mut cached_analysis,
+                        &mut cached_model_from_db,
+                        &mut analysis_count,
+                        &latest_breakdown,
+                        &breakdown_version,
+                        &snapshot,
+                    );
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -415,9 +453,11 @@ fn run_poller(
                             &mut busy_this_poll,
                             paused,
                             false,
+                            false,
                             &index_reload_count,
                             &model_scan_count,
                             &latest_breakdown,
+                            &breakdown_version,
                             &latest_index,
                             &snapshot,
                         );
@@ -515,8 +555,10 @@ fn run_phase2_worker(
     paths: GeminiPaths,
     notify: Option<Arc<dyn Fn() + Send + Sync>>,
     rx: mpsc::Receiver<Phase2Cmd>,
+    poller_tx: Sender<PollerMsg>,
     snapshot: Arc<Mutex<MonitorSnapshot>>,
     latest_breakdown: Arc<Mutex<Option<CustomizationBreakdown>>>,
+    breakdown_version: Arc<AtomicU64>,
     latest_index: Arc<Mutex<Option<SessionIndex>>>,
     shutdown_flag: Arc<AtomicBool>,
     usage_gen: Arc<AtomicU64>,
@@ -541,11 +583,10 @@ fn run_phase2_worker(
                 {
                     continue;
                 }
-                let index = latest_index
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .unwrap_or_else(|| load_session_index(&paths));
+                let index = load_session_index(&paths);
+                if let Ok(mut guard) = latest_index.lock() {
+                    *guard = Some(index.clone());
+                }
                 if shutdown_flag.load(Ordering::SeqCst)
                     || cancel.load(Ordering::SeqCst)
                     || usage_gen.load(Ordering::SeqCst) != generation
@@ -587,10 +628,15 @@ fn run_phase2_worker(
                 {
                     continue;
                 }
+                let mut breakdown_changed = false;
                 if let Some(inv_val) = inv {
                     let bd = inv_val.breakdown.clone();
-                    if let Ok(mut guard) = latest_breakdown.lock() {
+                    if let Ok(mut guard) = latest_breakdown.lock()
+                        && guard.as_ref() != Some(&bd)
+                    {
                         *guard = Some(bd);
+                        breakdown_version.fetch_add(1, Ordering::SeqCst);
+                        breakdown_changed = true;
                     }
                     if let Ok(mut guard) = snapshot.lock() {
                         guard.customizations = Some(inv_val);
@@ -601,6 +647,9 @@ fn run_phase2_worker(
                 }
                 if let Some(cb) = &notify {
                     cb();
+                }
+                if breakdown_changed {
+                    let _ = poller_tx.send(PollerMsg::BreakdownUpdated);
                 }
             }
         }
@@ -613,6 +662,50 @@ enum CommandOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn apply_poller_msg(
+    msg: PollerMsg,
+    follow_latest: &mut bool,
+    paused: &mut bool,
+    selected_id: &mut Option<String>,
+    should_poll: &mut bool,
+    force_reanalyze: &mut bool,
+    refresh_breakdown: &mut bool,
+    reanalyze_cached: &mut bool,
+    snapshot: &Arc<Mutex<MonitorSnapshot>>,
+    notify: &Option<Arc<dyn Fn() + Send + Sync>>,
+    phase2_tx: &Sender<Phase2Cmd>,
+    shutdown_flag: &Arc<AtomicBool>,
+    usage_cancel: &Arc<Mutex<Arc<AtomicBool>>>,
+    custom_cancel: &Arc<Mutex<Arc<AtomicBool>>>,
+    usage_gen: &Arc<AtomicU64>,
+    custom_gen: &Arc<AtomicU64>,
+) -> CommandOutcome {
+    match msg {
+        PollerMsg::Public(cmd) => apply_command(
+            cmd,
+            follow_latest,
+            paused,
+            selected_id,
+            should_poll,
+            force_reanalyze,
+            refresh_breakdown,
+            snapshot,
+            notify,
+            phase2_tx,
+            shutdown_flag,
+            usage_cancel,
+            custom_cancel,
+            usage_gen,
+            custom_gen,
+        ),
+        PollerMsg::BreakdownUpdated => {
+            *reanalyze_cached = true;
+            CommandOutcome::Continue
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_command(
     cmd: MonitorCommand,
     follow_latest: &mut bool,
@@ -620,6 +713,7 @@ fn apply_command(
     selected_id: &mut Option<String>,
     should_poll: &mut bool,
     force_reanalyze: &mut bool,
+    refresh_breakdown: &mut bool,
     snapshot: &Arc<Mutex<MonitorSnapshot>>,
     notify: &Option<Arc<dyn Fn() + Send + Sync>>,
     phase2_tx: &Sender<Phase2Cmd>,
@@ -654,6 +748,7 @@ fn apply_command(
         MonitorCommand::RefreshNow => {
             *should_poll = true;
             *force_reanalyze = true;
+            *refresh_breakdown = true;
         }
         MonitorCommand::RefreshUsage(period) => {
             dispatch_usage_refresh(
@@ -697,6 +792,154 @@ fn update_paused_state(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn analyze_selected_in_index(
+    config: &MonitorConfig,
+    index: &SessionIndex,
+    selected_id: Option<&str>,
+    force_reanalyze: bool,
+    cached_key: &mut Option<AnalysisCacheKey>,
+    cached_analysis: &mut Option<ConversationAnalysis>,
+    cached_model_from_db: &mut bool,
+    analysis_count: &mut u64,
+    latest_breakdown: &Arc<Mutex<Option<CustomizationBreakdown>>>,
+    breakdown_version: &Arc<AtomicU64>,
+) -> (bool, Option<DbFingerprint>, Option<String>, bool) {
+    if cached_analysis.as_ref().map(|a| a.conversation_id.as_str()) != selected_id {
+        *cached_key = None;
+        *cached_analysis = None;
+        *cached_model_from_db = false;
+    }
+
+    let Some(conv_id) = selected_id else {
+        *cached_key = None;
+        *cached_analysis = None;
+        *cached_model_from_db = false;
+        return (false, None, None, false);
+    };
+    let Some(summary) = index.by_id.get(conv_id) else {
+        *cached_key = None;
+        *cached_analysis = None;
+        *cached_model_from_db = false;
+        return (false, None, None, false);
+    };
+
+    let app_data = &summary.app_data_dir;
+    let logs_dir = app_data
+        .join("brain")
+        .join(conv_id)
+        .join(".system_generated")
+        .join("logs");
+    let conv_db = app_data.join("conversations").join(format!("{conv_id}.db"));
+    let pbtxt_path = app_data.join("antigravity_state.pbtxt");
+    let db_fp = DbFingerprint::from_db_path(&conv_db);
+
+    let (cached_bd, bd_ver) = if let Ok(guard) = latest_breakdown.lock() {
+        (guard.clone(), breakdown_version.load(Ordering::SeqCst))
+    } else {
+        (None, breakdown_version.load(Ordering::SeqCst))
+    };
+
+    let mut key = AnalysisCacheKey {
+        conv_id: conv_id.to_string(),
+        transcript_fp: TranscriptFingerprint::from_logs_dir(&logs_dir),
+        db_fp,
+        pbtxt_fp: FileStamp::from_path(&pbtxt_path),
+        breakdown_version: bd_ver,
+    };
+
+    let cache_hit = !force_reanalyze && cached_key.as_ref() == Some(&key);
+    if cache_hit {
+        let analysis_db_busy = cached_analysis.as_ref().is_some_and(|a| a.db_busy);
+        return (analysis_db_busy, Some(db_fp), None, false);
+    }
+
+    let breakdown = if let Some(bd) = cached_bd {
+        Some(bd)
+    } else {
+        let scanned = crate::customizations::scan_customizations(&config.paths).breakdown;
+        if let Ok(mut guard) = latest_breakdown.lock() {
+            if let Some(existing) = guard.as_ref() {
+                key.breakdown_version = breakdown_version.load(Ordering::SeqCst);
+                Some(existing.clone())
+            } else {
+                *guard = Some(scanned.clone());
+                Some(scanned)
+            }
+        } else {
+            Some(scanned)
+        }
+    };
+
+    match analyze_conversation_with_meta_and_customizations(
+        app_data, conv_id, None, None, breakdown,
+    ) {
+        Ok((res, model_from_db)) => {
+            let analysis_db_busy = res.db_busy;
+            // Do not freeze the cache key if the DB was busy so the next poll
+            // retries reading model/limit metadata once the lock clears.
+            *cached_key = if res.db_busy { None } else { Some(key) };
+            *cached_analysis = Some(res);
+            *cached_model_from_db = model_from_db;
+            *analysis_count += 1;
+            (analysis_db_busy, Some(db_fp), None, true)
+        }
+        Err(e) => {
+            *cached_key = None;
+            *cached_analysis = None;
+            *cached_model_from_db = false;
+            (false, Some(db_fp), Some(e.to_string()), true)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reanalyze_selected_with_cached_index(
+    config: &MonitorConfig,
+    selected_id: Option<&str>,
+    cached_index: Option<&SessionIndex>,
+    cached_key: &mut Option<AnalysisCacheKey>,
+    cached_analysis: &mut Option<ConversationAnalysis>,
+    cached_model_from_db: &mut bool,
+    analysis_count: &mut u64,
+    latest_breakdown: &Arc<Mutex<Option<CustomizationBreakdown>>>,
+    breakdown_version: &Arc<AtomicU64>,
+    snapshot: &Arc<Mutex<MonitorSnapshot>>,
+) {
+    let Some(index) = cached_index else {
+        return;
+    };
+
+    let (analysis_db_busy, _selected_db_fp, last_error, updated) = analyze_selected_in_index(
+        config,
+        index,
+        selected_id,
+        false,
+        cached_key,
+        cached_analysis,
+        cached_model_from_db,
+        analysis_count,
+        latest_breakdown,
+        breakdown_version,
+    );
+    if !updated {
+        return;
+    }
+
+    let db_busy = index.db_busy || analysis_db_busy;
+    let now = Utc::now();
+    if let Ok(mut guard) = snapshot.lock() {
+        guard.analysis = cached_analysis.clone();
+        guard.last_updated_at = Some(now);
+        guard.last_error = last_error;
+        guard.db_busy = db_busy;
+        guard.analysis_count = *analysis_count;
+    }
+    if let Some(cb) = &config.notify {
+        cb();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn perform_poll(
     config: &MonitorConfig,
     follow_latest: &mut bool,
@@ -710,12 +953,24 @@ fn perform_poll(
     busy_this_poll: &mut HashSet<String>,
     paused: bool,
     force_reanalyze: bool,
+    refresh_breakdown: bool,
     index_reload_count: &Arc<AtomicU64>,
     model_scan_count: &Arc<AtomicU64>,
     latest_breakdown: &Arc<Mutex<Option<CustomizationBreakdown>>>,
+    breakdown_version: &Arc<AtomicU64>,
     latest_index: &Arc<Mutex<Option<SessionIndex>>>,
     snapshot: &Arc<Mutex<MonitorSnapshot>>,
 ) -> bool {
+    if refresh_breakdown {
+        let fresh_bd = crate::customizations::scan_customizations(&config.paths).breakdown;
+        if let Ok(mut guard) = latest_breakdown.lock()
+            && guard.as_ref() != Some(&fresh_bd)
+        {
+            *guard = Some(fresh_bd);
+            breakdown_version.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     index_reload_count.fetch_add(1, Ordering::SeqCst);
     let mut index = load_session_index(&config.paths);
 
@@ -729,83 +984,18 @@ fn perform_poll(
         *selected_id = Some(latest.to_string());
     }
 
-    if cached_analysis.as_ref().map(|a| a.conversation_id.as_str()) != selected_id.as_deref() {
-        *cached_key = None;
-        *cached_analysis = None;
-        *cached_model_from_db = false;
-    }
-
-    let mut last_error: Option<String> = None;
-    let mut analysis_db_busy = false;
-    let mut selected_db_fp: Option<DbFingerprint> = None;
-
-    if let Some(conv_id) = selected_id.clone() {
-        if let Some(summary) = index.by_id.get(&conv_id) {
-            let app_data = &summary.app_data_dir;
-            let logs_dir = app_data
-                .join("brain")
-                .join(&conv_id)
-                .join(".system_generated")
-                .join("logs");
-            let conv_db = app_data.join("conversations").join(format!("{conv_id}.db"));
-            let pbtxt_path = app_data.join("antigravity_state.pbtxt");
-            let db_fp = DbFingerprint::from_db_path(&conv_db);
-            selected_db_fp = Some(db_fp);
-
-            let key = AnalysisCacheKey {
-                conv_id: conv_id.clone(),
-                transcript_fp: TranscriptFingerprint::from_logs_dir(&logs_dir),
-                db_fp,
-                pbtxt_fp: FileStamp::from_path(&pbtxt_path),
-            };
-
-            let cache_hit = !force_reanalyze && cached_key.as_ref() == Some(&key);
-            if !cache_hit {
-                let breakdown = {
-                    let cached_bd = latest_breakdown.lock().ok().and_then(|g| g.clone());
-                    if let Some(bd) = cached_bd {
-                        Some(bd)
-                    } else {
-                        let bd =
-                            crate::customizations::scan_customizations(&config.paths).breakdown;
-                        if let Ok(mut guard) = latest_breakdown.lock() {
-                            *guard = Some(bd.clone());
-                        }
-                        Some(bd)
-                    }
-                };
-                match analyze_conversation_with_meta_and_customizations(
-                    app_data, &conv_id, None, None, breakdown,
-                ) {
-                    Ok((res, model_from_db)) => {
-                        analysis_db_busy = res.db_busy;
-                        // Do not freeze the cache key if the DB was busy so the next poll
-                        // retries reading model/limit metadata once the lock clears.
-                        *cached_key = if res.db_busy { None } else { Some(key) };
-                        *cached_analysis = Some(res);
-                        *cached_model_from_db = model_from_db;
-                        *analysis_count += 1;
-                    }
-                    Err(e) => {
-                        last_error = Some(e.to_string());
-                        *cached_key = None;
-                        *cached_analysis = None;
-                        *cached_model_from_db = false;
-                    }
-                }
-            } else if let Some(a) = cached_analysis.as_ref() {
-                analysis_db_busy = a.db_busy;
-            }
-        } else {
-            *cached_key = None;
-            *cached_analysis = None;
-            *cached_model_from_db = false;
-        }
-    } else {
-        *cached_key = None;
-        *cached_analysis = None;
-        *cached_model_from_db = false;
-    }
+    let (analysis_db_busy, selected_db_fp, last_error, _) = analyze_selected_in_index(
+        config,
+        &index,
+        selected_id.as_deref(),
+        force_reanalyze,
+        cached_key,
+        cached_analysis,
+        cached_model_from_db,
+        analysis_count,
+        latest_breakdown,
+        breakdown_version,
+    );
 
     let pending_backfill = populate_session_model_labels(
         &mut index,

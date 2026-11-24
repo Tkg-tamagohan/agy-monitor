@@ -933,7 +933,7 @@ fn parse_frontmatter(fm_raw: &str) -> Frontmatter<'_> {
             continue;
         };
         let key = raw_key.trim();
-        let val_inline = raw_rest.trim();
+        let val_inline = strip_yaml_inline_comment(raw_rest.trim());
 
         let (val_combined, next_idx) = collect_yaml_value(&lines, idx + 1, val_inline);
         idx = next_idx;
@@ -1010,7 +1010,12 @@ fn collect_yaml_value(lines: &[&str], mut idx: usize, inline: &str) -> (String, 
             break;
         }
         if next.starts_with(' ') || next.starts_with('\t') {
-            let cleaned = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim();
+            let cleaned_raw = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim();
+            let cleaned = if is_block_scalar || has_open_yaml_quote(&parts) {
+                cleaned_raw
+            } else {
+                strip_yaml_inline_comment(cleaned_raw)
+            };
             if !cleaned.is_empty() {
                 parts.push(cleaned.to_string());
             }
@@ -1021,6 +1026,71 @@ fn collect_yaml_value(lines: &[&str], mut idx: usize, inline: &str) -> (String, 
     }
 
     (parts.join(" "), idx)
+}
+
+/// Strips an inline `# ...` YAML comment outside single/double quotes when `#` is at
+/// index 0 or preceded by ASCII whitespace, preserving `#` inside quoted scalars.
+fn strip_yaml_inline_comment(raw: &str) -> &str {
+    let (comment_idx, _) = scan_yaml_quotes(raw, (false, false, false), true);
+    match comment_idx {
+        Some(idx) => raw[..idx].trim_end(),
+        None => raw,
+    }
+}
+
+fn has_open_yaml_quote(parts: &[String]) -> bool {
+    let mut state = (false, false, false);
+    for part in parts {
+        let (_, next_state) = scan_yaml_quotes(part, state, false);
+        state = next_state;
+    }
+    state.0 || state.1
+}
+
+fn scan_yaml_quotes(
+    raw: &str,
+    (mut in_single, mut in_double, mut escaped): (bool, bool, bool),
+    stop_at_comment: bool,
+) -> (Option<usize>, (bool, bool, bool)) {
+    let mut prev_is_ws = false;
+
+    for (idx, ch) in raw.char_indices() {
+        if in_double {
+            if escaped {
+                escaped = false;
+                prev_is_ws = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                prev_is_ws = false;
+                continue;
+            }
+            if ch == '"' {
+                in_double = false;
+            }
+            prev_is_ws = ch.is_ascii_whitespace();
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+            prev_is_ws = ch.is_ascii_whitespace();
+            continue;
+        }
+        match ch {
+            '"' => in_double = true,
+            '\'' => in_single = true,
+            '#' if stop_at_comment && (idx == 0 || prev_is_ws) => {
+                return (Some(idx), (in_single, in_double, escaped));
+            }
+            _ => {}
+        }
+        prev_is_ws = ch.is_ascii_whitespace();
+    }
+
+    (None, (in_single, in_double, escaped))
 }
 
 fn unquote_yaml_scalar(s: &str) -> String {

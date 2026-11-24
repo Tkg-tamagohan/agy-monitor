@@ -513,3 +513,109 @@ fn cust_06_missing_dir_returns_empty_inventory() {
     let inv = scan_customizations(&GeminiPaths::from_gemini_dir(&missing));
     assert_eq!(inv, CustomizationInventory::default());
 }
+
+/// CUST-07: Inline YAML comments in frontmatter are stripped outside quotes while
+/// preserving `#` inside single/double-quoted scalars and multi-line block scalars.
+#[test]
+fn cust_07_frontmatter_inline_comments_and_quoted_hashes() {
+    let tmp = TempDir::new().unwrap();
+    let g = tmp.path();
+
+    let plugin_dir = g.join("config").join("plugins").join("comment-plugin");
+    let rules_dir = plugin_dir.join("rules");
+
+    let deferred_comment_rule = "\
+---
+alwaysApply: false # 必要時のみ
+---
+# Deferred With Inline Comment
+";
+    write_file(
+        &rules_dir.join("deferred_comment.md"),
+        deferred_comment_rule.as_bytes(),
+    );
+
+    let always_comment_rule = "\
+---
+alwaysApply: true # 常時適用
+globs: [] # empty list
+paths:
+  # only a comment in paths
+---
+# Always With Inline Comments
+";
+    write_file(
+        &rules_dir.join("always_comment.md"),
+        always_comment_rule.as_bytes(),
+    );
+
+    let block_scalar_rule = "\
+---
+description: | # block scalar header comment
+  # Literal markdown heading inside block scalar
+  Details here.
+---
+# Block Scalar Description Rule
+";
+    write_file(
+        &rules_dir.join("block_scalar.md"),
+        block_scalar_rule.as_bytes(),
+    );
+
+    let agents_dir = plugin_dir.join("agents");
+    let rule_hash_agent = "\
+---
+name: \"Rule #1\" # trailing comment
+description: \"Handles \\\" # escaped hash\" # outside comment
+---
+# Agent 1
+";
+    write_file(&agents_dir.join("agent1.md"), rule_hash_agent.as_bytes());
+
+    let skill_dir = plugin_dir.join("skills").join("hash-skill");
+    let skill_md = "\
+---
+name: 'Skill #2' # single-quoted hash preserved
+description: 'Checks #2 behavior'
+---
+Skill body.
+";
+    write_file(&skill_dir.join("SKILL.md"), skill_md.as_bytes());
+
+    let inv = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    assert!(
+        inv.scan_warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        inv.scan_warnings
+    );
+
+    assert_eq!(
+        inv.breakdown.rules_deferred,
+        est_text_tokens(deferred_comment_rule) + est_text_tokens(block_scalar_rule)
+    );
+    assert_eq!(
+        inv.breakdown.rules_files,
+        est_text_tokens(always_comment_rule)
+    );
+
+    assert!(inv.items.iter().any(|i| {
+        i.kind == CustomizationKind::RuleFile
+            && i.name == "deferred_comment"
+            && i.timing == LoadTiming::Deferred
+    }));
+    assert!(inv.items.iter().any(|i| {
+        i.kind == CustomizationKind::RuleFile
+            && i.name == "always_comment"
+            && i.timing == LoadTiming::Always
+    }));
+    assert!(inv.items.iter().any(|i| {
+        i.kind == CustomizationKind::CustomAgent
+            && i.name == "Rule #1"
+            && i.timing == LoadTiming::Always
+    }));
+    assert!(inv.items.iter().any(|i| {
+        i.kind == CustomizationKind::SkillIndex
+            && i.name == "Skill #2"
+            && i.timing == LoadTiming::Always
+    }));
+}
