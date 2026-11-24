@@ -618,4 +618,41 @@ Skill body.
             && i.name == "Skill #2"
             && i.timing == LoadTiming::Always
     }));
+
+    // Multi-line quoted value with `#` followed by closing quote and trailing `#` comment,
+    // plus a large multi-line `paths:` list (~8,000 entries under 512 KiB) to verify linear-time parsing.
+    let multiline_agent = "\
+---
+name: \"Multi #1
+  part #2\" # trailing comment after closed quote
+---
+Body.
+";
+    write_file(&agents_dir.join("multiline.md"), multiline_agent.as_bytes());
+
+    let mut large_paths_rule = String::from("---\npaths:\n");
+    for i in 0..8000 {
+        large_paths_rule.push_str(&format!(
+            "  - crates/mod_{i:04}/some_reasonably_long_file.rs\n"
+        ));
+    }
+    large_paths_rule.push_str("---\n# Large Paths Rule\n");
+    assert!(large_paths_rule.len() < 512 * 1024);
+    write_file(
+        &rules_dir.join("large_paths.md"),
+        large_paths_rule.as_bytes(),
+    );
+
+    let inv2 = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    assert!(inv2.scan_warnings.is_empty());
+    assert!(inv2.items.iter().any(|i| {
+        i.kind == CustomizationKind::CustomAgent
+            && i.name == "Multi #1 part #2"
+            && i.timing == LoadTiming::Always
+    }));
+    assert!(inv2.items.iter().any(|i| {
+        i.kind == CustomizationKind::RuleFile
+            && i.name == "large_paths"
+            && i.timing == LoadTiming::Deferred
+    }));
 }

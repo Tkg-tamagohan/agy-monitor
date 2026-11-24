@@ -524,28 +524,7 @@ fn render_daily_plot(ui: &mut egui::Ui, daily: &[DailyUsagePoint], palette: &Pal
             }
             String::new()
         })
-        .label_formatter(move |pos| match pos {
-            HoverPosition::NearDataPoint {
-                plot_name,
-                position,
-                ..
-            } => {
-                let date_str = format_plot_day(position.x, label_base, &label_fallback, "%Y-%m-%d")
-                    .unwrap_or_else(|| format!("{:.0}", position.x));
-                let tok_str = format_tokens(position.y.round().max(0.0) as u64);
-                if plot_name.is_empty() {
-                    Some(format!("{date_str}: {tok_str}"))
-                } else {
-                    Some(format!("{plot_name}\n{date_str}: {tok_str}"))
-                }
-            }
-            HoverPosition::Elsewhere { position } => {
-                let date_str =
-                    format_plot_day(position.x, label_base, &label_fallback, "%Y-%m-%d")?;
-                let tok_str = format_tokens(position.y.round().max(0.0) as u64);
-                Some(format!("{date_str}: {tok_str}"))
-            }
-        })
+        .label_formatter(move |pos| format_daily_hover_label(pos, label_base, &label_fallback))
         .legend(Legend::default().position(Corner::LeftTop))
         .show(ui, |plot_ui| {
             plot_ui.line(
@@ -1065,6 +1044,30 @@ fn format_tokens(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+fn format_daily_hover_label(
+    pos: &HoverPosition<'_>,
+    base_date: Option<NaiveDate>,
+    fallback_labels: &[String],
+) -> Option<String> {
+    match pos {
+        HoverPosition::NearDataPoint {
+            plot_name,
+            position,
+            ..
+        } => {
+            let date_str = format_plot_day(position.x, base_date, fallback_labels, "%Y-%m-%d")
+                .unwrap_or_else(|| format!("{:.0}", position.x));
+            let tok_str = format_tokens(position.y.round().max(0.0) as u64);
+            if plot_name.is_empty() {
+                Some(format!("{date_str}: {tok_str}"))
+            } else {
+                Some(format!("{plot_name}\n{date_str}: {tok_str}"))
+            }
+        }
+        HoverPosition::Elsewhere { .. } => None,
     }
 }
 
@@ -1706,6 +1709,32 @@ mod tests {
         assert!(
             texts_empty.iter().any(|(t, _, _)| t == "app"),
             "unfiltered surface breakdown row must remain visible even when project match is 0"
+        );
+
+        let base = NaiveDate::from_ymd_opt(2026, 11, 1);
+        let fallback = vec!["2026-11-01".to_string()];
+        assert_eq!(
+            format_daily_hover_label(
+                &HoverPosition::Elsewhere {
+                    position: egui_plot::PlotPoint::new(10.0, 1234.0),
+                },
+                base,
+                &fallback,
+            ),
+            None,
+            "hover outside data points must not display synthetic cursor values"
+        );
+        assert_eq!(
+            format_daily_hover_label(
+                &HoverPosition::NearDataPoint {
+                    plot_name: "入力",
+                    position: egui_plot::PlotPoint::new(23.0, 1500.0),
+                    index: 0,
+                },
+                base,
+                &fallback,
+            ),
+            Some("入力\n2026-11-24: 1500".to_string())
         );
     }
 }

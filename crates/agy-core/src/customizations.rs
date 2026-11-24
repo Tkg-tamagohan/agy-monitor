@@ -995,7 +995,10 @@ fn parse_frontmatter(fm_raw: &str) -> Frontmatter<'_> {
 fn collect_yaml_value(lines: &[&str], mut idx: usize, inline: &str) -> (String, usize) {
     let is_block_scalar = matches!(inline, "|" | ">" | "|-" | ">-" | "|+" | ">+");
     let mut parts: Vec<String> = Vec::new();
+    let mut quote_state = (false, false, false);
     if !is_block_scalar && !inline.is_empty() {
+        let (_, next_state) = scan_yaml_quotes(inline, quote_state, false);
+        quote_state = next_state;
         parts.push(inline.to_string());
     }
 
@@ -1011,10 +1014,15 @@ fn collect_yaml_value(lines: &[&str], mut idx: usize, inline: &str) -> (String, 
         }
         if next.starts_with(' ') || next.starts_with('\t') {
             let cleaned_raw = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim();
-            let cleaned = if is_block_scalar || has_open_yaml_quote(&parts) {
+            let cleaned = if is_block_scalar {
                 cleaned_raw
             } else {
-                strip_yaml_inline_comment(cleaned_raw)
+                let (comment_idx, next_state) = scan_yaml_quotes(cleaned_raw, quote_state, true);
+                quote_state = next_state;
+                match comment_idx {
+                    Some(c) => cleaned_raw[..c].trim_end(),
+                    None => cleaned_raw,
+                }
             };
             if !cleaned.is_empty() {
                 parts.push(cleaned.to_string());
@@ -1036,15 +1044,6 @@ fn strip_yaml_inline_comment(raw: &str) -> &str {
         Some(idx) => raw[..idx].trim_end(),
         None => raw,
     }
-}
-
-fn has_open_yaml_quote(parts: &[String]) -> bool {
-    let mut state = (false, false, false);
-    for part in parts {
-        let (_, next_state) = scan_yaml_quotes(part, state, false);
-        state = next_state;
-    }
-    state.0 || state.1
 }
 
 fn scan_yaml_quotes(
