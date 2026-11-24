@@ -34,7 +34,7 @@ cargo run --release -p agy-gui --bin agy-monitor
 `~/.gemini/` 配下のデータベースおよびログファイルへは一切書き込まない。
 SQLite ファイル（`conversation_summaries.db`、`conversations/<conv_id>.db`）はすべて `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX`、`PRAGMA query_only = ON`、ビジータイムアウト（150ms）で開く。
 競合時にビジーまたはロックエラーが返る読み取り経路（`conversation_summaries.db` の一覧取得と選択中セッションの解析）では、バックオフ付き再試行（30ms、80ms、160ms）を行う。
-ただし、`conversation_summaries.db` のテーブル存在確認でエラーが起きた場合は空一覧として扱い、サイドバーの一覧表示で使う軽量なモデル名取得では再試行を行わずビジー時にその周期をスキップする。
+ただし、サイドバーの一覧表示で使う軽量なモデル名取得では再試行を行わずビジー時にその周期をスキップする。
 会話ログ（`transcript_full.jsonl`、`transcript.jsonl`）と状態ファイル（`antigravity_state.pbtxt`）も読み取り専用で参照する。
 
 ## リポジトリ構成

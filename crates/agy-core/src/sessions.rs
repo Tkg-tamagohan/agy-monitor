@@ -427,13 +427,11 @@ fn read_summaries_for_root(root: &AppDataRoot) -> (Vec<RawSummaryRow>, bool) {
     }
 
     let res = with_readonly_retry(&db_path, |conn| {
-        let has_table: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_summaries')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(false);
+        let has_table: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_summaries')",
+            [],
+            |r| r.get(0),
+        )?;
         if !has_table {
             return Ok(Vec::new());
         }
@@ -441,8 +439,8 @@ fn read_summaries_for_root(root: &AppDataRoot) -> (Vec<RawSummaryRow>, bool) {
         let mut col_stmt = conn.prepare("PRAGMA table_info(conversation_summaries)")?;
         let cols: HashSet<String> = col_stmt
             .query_map([], |r| r.get::<_, String>(1))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<std::result::Result<HashSet<String>, rusqlite::Error>>(
+        )?;
 
         let preview_expr = if cols.contains("preview") {
             "COALESCE(preview, '')"

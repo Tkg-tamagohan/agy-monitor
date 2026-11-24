@@ -39,3 +39,8 @@ cargo test --workspace --locked; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 - `smoke_01_readonly_real_gemini_data` は実 `~/.gemini/antigravity` 依存の `#[ignore]` テストであるため、通常テストおよび CI 実行対象からは除外した状態を保つ。
 - Windows PowerShell 5.1 では `&&` を使わず `; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }` を用い、日本語を含むコミットメッセージと PR 本文は BOM なし UTF-8 の一時ファイル経由で渡す。
+
+## ドキュメント記述とコード照合の原則
+
+- `PR #3 PRG-001`：動作環境や SQLite 再試行の適用範囲、キャッシュ対象範囲を文書へ記載するときは、Edition や共通ヘルパーの存在だけから一律に推測しない。
+  全呼び出し元とクロージャ内のエラー伝播、および CI ワークフロー定義を実コードと突き合わせて確認し、適用対象と例外を明記する。
