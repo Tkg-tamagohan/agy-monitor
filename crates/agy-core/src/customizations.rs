@@ -1017,6 +1017,8 @@ fn collect_yaml_value(lines: &[&str], mut idx: usize, inline: &str) -> (String, 
             let cleaned = if is_block_scalar {
                 cleaned_raw
             } else {
+                // A trailing backslash escapes the line break, not the next line's first character.
+                quote_state.2 = false;
                 let (comment_idx, next_state) = scan_yaml_quotes(cleaned_raw, quote_state, true);
                 quote_state = next_state;
                 match comment_idx {

@@ -630,6 +630,18 @@ Body.
 ";
     write_file(&agents_dir.join("multiline.md"), multiline_agent.as_bytes());
 
+    let escaped_eol_agent = "\
+---
+name: \"Build\\
+  \\\" #tag\" # trailing comment after closed quote
+---
+Body.
+";
+    write_file(
+        &agents_dir.join("escaped_eol.md"),
+        escaped_eol_agent.as_bytes(),
+    );
+
     let mut large_paths_rule = String::from("---\npaths:\n");
     for i in 0..8000 {
         large_paths_rule.push_str(&format!(
@@ -648,6 +660,11 @@ Body.
     assert!(inv2.items.iter().any(|i| {
         i.kind == CustomizationKind::CustomAgent
             && i.name == "Multi #1 part #2"
+            && i.timing == LoadTiming::Always
+    }));
+    assert!(inv2.items.iter().any(|i| {
+        i.kind == CustomizationKind::CustomAgent
+            && i.name == "Build\\ \\\" #tag"
             && i.timing == LoadTiming::Always
     }));
     assert!(inv2.items.iter().any(|i| {
