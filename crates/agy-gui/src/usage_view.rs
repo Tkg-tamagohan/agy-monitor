@@ -177,23 +177,29 @@ fn render_usage_stats_view(
                     .map(|r| truncate_ui(&r.label, 18))
                     .unwrap_or_else(|| truncate_ui(key, 18)),
             };
-            let prev_selected = state.selected_project_key.clone();
             egui::ComboBox::from_id_salt("usage_project_selector")
                 .width(combo_w)
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.selected_project_key, None, "すべて");
+                    if ui
+                        .selectable_value(&mut state.selected_project_key, None, "すべて")
+                        .clicked()
+                    {
+                        state.project_filter.clear();
+                    }
                     for row in &report.by_project {
-                        ui.selectable_value(
-                            &mut state.selected_project_key,
-                            Some(row.key.clone()),
-                            &row.label,
-                        );
+                        if ui
+                            .selectable_value(
+                                &mut state.selected_project_key,
+                                Some(row.key.clone()),
+                                &row.label,
+                            )
+                            .clicked()
+                        {
+                            state.project_filter.clear();
+                        }
                     }
                 });
-            if state.selected_project_key != prev_selected {
-                state.project_filter.clear();
-            }
         }
 
         if (state.selected_project_key.is_some() || !state.project_filter.is_empty())
@@ -1889,5 +1895,86 @@ mod tests {
         );
         assert!(texts_sub.iter().any(|(t, _, _)| t == "100.0k"));
         assert!(texts_sub.iter().any(|(t, _, _)| t == "250.0k"));
+    }
+
+    #[test]
+    fn gui_15_selecting_all_projects_clears_text_filter() {
+        let report = sample_usage_report(false);
+        let ctx = egui::Context::default();
+        install_japanese_fonts(&ctx);
+        apply_theme(&ctx, ThemeMode::Dark);
+        let palette = Palette::for_mode(ThemeMode::Dark);
+        let viewport = egui::vec2(520.0, 1100.0);
+
+        let mut frame_time = 0.0_f64;
+        let mut run_frame = |state: &mut UsageViewState, events: Vec<egui::Event>, label: &str| {
+            frame_time += 0.05;
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                time: Some(frame_time),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw_input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let _ =
+                        render_usage_phase2(ui, state, Some(&report), false, None, false, &palette);
+                });
+            });
+            assert_clips_within_viewport(&output.shapes, viewport.x, viewport.y, label);
+            let texts = collect_rendered_texts(&output.shapes);
+            output.textures_delta.clear();
+            texts
+        };
+
+        // Start with free-text filter active and selected_project_key == None.
+        let mut state = UsageViewState {
+            sub_tab: Phase2SubTab::UsageStats,
+            project_filter: "agy-monitor".to_string(),
+            selected_project_key: None,
+            ..Default::default()
+        };
+        let _ = run_frame(&mut state, vec![], "gui_15_warmup");
+        let texts_filtered = run_frame(&mut state, vec![], "gui_15_filtered");
+        assert!(
+            texts_filtered
+                .iter()
+                .any(|(t, _, _)| t == "(一致 1 / 2 件)")
+        );
+
+        // Open ComboBox by clicking its closed button ("すべて"), then advance one frame for popup rendering.
+        let combo_btn_pos = texts_filtered
+            .iter()
+            .find(|(t, _, _)| t == "すべて")
+            .expect("project selector ComboBox button")
+            .1
+            .center();
+        let _ = run_frame(
+            &mut state,
+            click_events(combo_btn_pos),
+            "gui_15_click_combo",
+        );
+        let texts_popup = run_frame(&mut state, vec![], "gui_15_open_popup");
+
+        // Click the "すべて" item inside the opened popup (distinct rect from the closed button).
+        let popup_all_pos = texts_popup
+            .iter()
+            .filter(|(t, rect, _)| t == "すべて" && rect.center().distance(combo_btn_pos) > 4.0)
+            .map(|(_, rect, _)| rect.center())
+            .next()
+            .expect("popup 'すべて' menu item must be visible");
+        let _ = run_frame(&mut state, click_events(popup_all_pos), "gui_15_click_all");
+        let texts_after = run_frame(&mut state, vec![], "gui_15_after");
+
+        assert!(
+            state.project_filter.is_empty(),
+            "selecting 'すべて' must clear free-text project_filter even when selected_project_key was already None"
+        );
+        assert!(state.selected_project_key.is_none());
+        assert!(
+            texts_after.iter().any(|(t, _, _)| t == "950.0k")
+                && texts_after.iter().any(|(t, _, _)| t == "300.0k"),
+            "all projects must be visible again after selecting 'すべて'"
+        );
     }
 }
