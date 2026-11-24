@@ -35,10 +35,23 @@ where
 pub(crate) fn with_readonly_retry_schedule<T, F>(
     path: &Path,
     backoffs_ms: &[u64],
+    f: F,
+) -> Result<T>
+where
+    F: FnMut(&Connection) -> Result<T>,
+{
+    with_readonly_retry_schedule_with_hook(path, backoffs_ms, |_| {}, f)
+}
+
+pub(crate) fn with_readonly_retry_schedule_with_hook<T, F, H>(
+    path: &Path,
+    backoffs_ms: &[u64],
+    mut on_retry: H,
     mut f: F,
 ) -> Result<T>
 where
     F: FnMut(&Connection) -> Result<T>,
+    H: FnMut(usize),
 {
     for attempt in 0..=backoffs_ms.len() {
         let res = match open_readonly(path) {
@@ -49,6 +62,7 @@ where
             Ok(val) => return Ok(val),
             Err(err) if is_busy_or_locked(&err) => {
                 if attempt < backoffs_ms.len() {
+                    on_retry(attempt);
                     std::thread::sleep(Duration::from_millis(backoffs_ms[attempt]));
                 } else {
                     return Err(CoreError::DbBusy {
