@@ -470,11 +470,14 @@ fn read_db_model_slugs(
 
     if db_ready {
         let query_fn = |conn: &rusqlite::Connection| {
+            found_slugs.clear();
+            agy_max_token_limit = 0;
+
             let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
             let tables: std::collections::HashSet<String> = stmt
                 .query_map([], |row| row.get::<_, String>(0))?
-                .filter_map(|r| r.ok())
-                .collect();
+                .collect::<std::result::Result<std::collections::HashSet<String>, rusqlite::Error>>(
+                )?;
 
             if steps_limit > 0 && tables.contains("steps") {
                 let sql = format!(

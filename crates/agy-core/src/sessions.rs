@@ -8,7 +8,7 @@ use crate::fingerprint::{DbFingerprint, TranscriptFingerprint};
 use crate::paths::{
     AppDataRoot, GeminiPaths, Surface, normalize_file_uri, normalize_path_key, path_basename,
 };
-use crate::sqlite::with_readonly_retry;
+use crate::sqlite::{RETRY_BACKOFFS_MS, with_readonly_retry_schedule_with_hook};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectInfo {
@@ -421,36 +421,48 @@ pub fn load_session_index(paths: &GeminiPaths) -> SessionIndex {
 }
 
 fn read_summaries_for_root(root: &AppDataRoot) -> (Vec<RawSummaryRow>, bool) {
+    read_summaries_for_root_with_hook(root, |_| {})
+}
+
+fn read_summaries_for_root_with_hook<H>(
+    root: &AppDataRoot,
+    on_retry: H,
+) -> (Vec<RawSummaryRow>, bool)
+where
+    H: FnMut(usize),
+{
     let db_path = root.dir.join("conversation_summaries.db");
     if !db_path.is_file() {
         return (Vec::new(), false);
     }
 
-    let res = with_readonly_retry(&db_path, |conn| {
-        let has_table: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_summaries')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(false);
-        if !has_table {
-            return Ok(Vec::new());
-        }
+    let res = with_readonly_retry_schedule_with_hook(
+        &db_path,
+        &RETRY_BACKOFFS_MS,
+        on_retry,
+        |conn| {
+            let has_table: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_summaries')",
+            [],
+            |r| r.get(0),
+        )?;
+            if !has_table {
+                return Ok(Vec::new());
+            }
 
-        let mut col_stmt = conn.prepare("PRAGMA table_info(conversation_summaries)")?;
-        let cols: HashSet<String> = col_stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .filter_map(|r| r.ok())
-            .collect();
+            let mut col_stmt = conn.prepare("PRAGMA table_info(conversation_summaries)")?;
+            let cols: HashSet<String> = col_stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<std::result::Result<HashSet<String>, rusqlite::Error>>(
+            )?;
 
-        let preview_expr = if cols.contains("preview") {
-            "COALESCE(preview, '')"
-        } else {
-            "''"
-        };
-        let query = format!(
-            "SELECT conversation_id,
+            let preview_expr = if cols.contains("preview") {
+                "COALESCE(preview, '')"
+            } else {
+                "''"
+            };
+            let query = format!(
+                "SELECT conversation_id,
                     COALESCE(title, ''),
                     {preview_expr},
                     COALESCE(workspace_uris, ''),
@@ -460,75 +472,76 @@ fn read_summaries_for_root(root: &AppDataRoot) -> (Vec<RawSummaryRow>, bool) {
                     COALESCE(nesting_depth, 0),
                     COALESCE(last_modified_time, '')
              FROM conversation_summaries"
-        );
-        let mut stmt = conn.prepare(&query)?;
-        let mut rows = stmt.query([])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            let conv_id: String = row.get::<_, String>(0).unwrap_or_default();
-            let conv_id = conv_id.trim().to_string();
-            if conv_id.is_empty() {
-                continue;
-            }
-            let title: String = row
-                .get::<_, String>(1)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let preview: String = row
-                .get::<_, String>(2)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let raw_uris: String = row.get::<_, String>(3).unwrap_or_default();
-            let (workspace_keys, workspace_paths) = parse_workspace_uris(&raw_uris);
-            let project_id: String = row
-                .get::<_, String>(4)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let agent_name: String = row
-                .get::<_, String>(5)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let parent_conversation_id: String = row
-                .get::<_, String>(6)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let nesting_depth: u32 = row.get::<_, i64>(7).unwrap_or(0).max(0) as u32;
-            let last_modified_ms = match row.get_ref(8) {
-                Ok(rusqlite::types::ValueRef::Text(bytes)) => {
-                    parse_datetime_ms(&String::from_utf8_lossy(bytes))
+            );
+            let mut stmt = conn.prepare(&query)?;
+            let mut rows = stmt.query([])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                let conv_id: String = row.get::<_, String>(0).unwrap_or_default();
+                let conv_id = conv_id.trim().to_string();
+                if conv_id.is_empty() {
+                    continue;
                 }
-                Ok(rusqlite::types::ValueRef::Integer(n)) => {
-                    if n > 0 && n < 10_000_000_000 {
-                        n * 1000
-                    } else {
-                        n.max(0)
+                let title: String = row
+                    .get::<_, String>(1)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let preview: String = row
+                    .get::<_, String>(2)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let raw_uris: String = row.get::<_, String>(3).unwrap_or_default();
+                let (workspace_keys, workspace_paths) = parse_workspace_uris(&raw_uris);
+                let project_id: String = row
+                    .get::<_, String>(4)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let agent_name: String = row
+                    .get::<_, String>(5)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let parent_conversation_id: String = row
+                    .get::<_, String>(6)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let nesting_depth: u32 = row.get::<_, i64>(7).unwrap_or(0).max(0) as u32;
+                let last_modified_ms = match row.get_ref(8) {
+                    Ok(rusqlite::types::ValueRef::Text(bytes)) => {
+                        parse_datetime_ms(&String::from_utf8_lossy(bytes))
                     }
-                }
-                _ => 0,
-            };
+                    Ok(rusqlite::types::ValueRef::Integer(n)) => {
+                        if n > 0 && n < 10_000_000_000 {
+                            n * 1000
+                        } else {
+                            n.max(0)
+                        }
+                    }
+                    _ => 0,
+                };
 
-            out.push(RawSummaryRow {
-                conversation_id: conv_id,
-                surface: root.surface,
-                app_data_dir: root.dir.clone(),
-                title,
-                preview,
-                workspace_keys,
-                workspace_paths,
-                project_id,
-                agent_name,
-                parent_conversation_id,
-                nesting_depth,
-                last_modified_ms,
-            });
-        }
-        Ok(out)
-    });
+                out.push(RawSummaryRow {
+                    conversation_id: conv_id,
+                    surface: root.surface,
+                    app_data_dir: root.dir.clone(),
+                    title,
+                    preview,
+                    workspace_keys,
+                    workspace_paths,
+                    project_id,
+                    agent_name,
+                    parent_conversation_id,
+                    nesting_depth,
+                    last_modified_ms,
+                });
+            }
+            Ok(out)
+        },
+    );
 
     match res {
         Ok(rows) => (rows, false),
@@ -622,4 +635,81 @@ pub fn compute_effective_mtime_ms(
         .max(tfp.latest_mtime_ms())
         .max(dfp.latest_mtime_ms());
     (effective, tfp.exists(), dfp.exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use rusqlite::{Connection, OpenFlags};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn sess_03_deterministic_retry_recovers_after_first_busy_callback() {
+        let tmp = TempDir::new().unwrap();
+        let app = tmp.path().join(".gemini").join("antigravity");
+        std::fs::create_dir_all(&app).unwrap();
+
+        let conv_id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        let sum_db = app.join("conversation_summaries.db");
+        let lock_conn = Connection::open_with_flags(
+            &sum_db,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .unwrap();
+        lock_conn
+            .execute_batch(
+                "CREATE TABLE conversation_summaries (
+                    conversation_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    preview TEXT NOT NULL DEFAULT '',
+                    workspace_uris TEXT NOT NULL DEFAULT '',
+                    project_id TEXT NOT NULL DEFAULT '',
+                    agent_name TEXT NOT NULL DEFAULT '',
+                    parent_conversation_id TEXT NOT NULL DEFAULT '',
+                    nesting_depth INTEGER NOT NULL DEFAULT 0,
+                    last_modified_time TEXT NOT NULL DEFAULT ''
+                );",
+            )
+            .unwrap();
+        lock_conn
+            .execute(
+                "INSERT INTO conversation_summaries VALUES (?1, ?2, '', '', '', '', '', 0, '2026-11-24 10:00:00+00:00')",
+                rusqlite::params![conv_id, "Deterministic Recovery"],
+            )
+            .unwrap();
+
+        lock_conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+        let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        let root = AppDataRoot {
+            surface: Surface::App,
+            dir: app,
+        };
+        let mut signaled = false;
+        let reader = std::thread::spawn(move || {
+            read_summaries_for_root_with_hook(&root, |attempt| {
+                if !signaled {
+                    signaled = true;
+                    let _ = busy_tx.send(attempt);
+                }
+            })
+        });
+
+        let attempt = busy_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader should trigger SQLITE_BUSY retry callback");
+        assert_eq!(attempt, 0);
+
+        lock_conn.execute_batch("COMMIT;").unwrap();
+        drop(lock_conn);
+
+        let (rows, db_busy) = reader.join().unwrap();
+        assert!(!db_busy, "reader should recover after lock release");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation_id, conv_id);
+        assert_eq!(rows[0].title, "Deterministic Recovery");
+    }
 }

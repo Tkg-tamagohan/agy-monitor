@@ -1748,3 +1748,143 @@ fn mon_06_backfill_keeps_fresh_selected_model_when_db_changes() {
 
     drop(handle);
 }
+
+#[test]
+fn sess_02_summaries_db_exclusively_locked_retries_and_sets_db_busy() {
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    std::fs::create_dir_all(&app).unwrap();
+
+    let conv_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let sum_db = app.join("conversation_summaries.db");
+    let lock_conn = Connection::open_with_flags(
+        &sum_db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .unwrap();
+    lock_conn
+        .execute_batch(
+            "CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                preview TEXT NOT NULL DEFAULT '',
+                workspace_uris TEXT NOT NULL DEFAULT '',
+                project_id TEXT NOT NULL DEFAULT '',
+                agent_name TEXT NOT NULL DEFAULT '',
+                parent_conversation_id TEXT NOT NULL DEFAULT '',
+                nesting_depth INTEGER NOT NULL DEFAULT 0,
+                last_modified_time TEXT NOT NULL DEFAULT ''
+            );",
+        )
+        .unwrap();
+    lock_conn
+        .execute(
+            "INSERT INTO conversation_summaries VALUES (?1, ?2, '', '', '', '', '', 0, '2026-11-24 10:00:00+00:00')",
+            rusqlite::params![conv_id, "Locked Session"],
+        )
+        .unwrap();
+
+    // Hold an exclusive lock across all retry attempts so sqlite_master / table_info hits SQLITE_BUSY.
+    lock_conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+    let start = Instant::now();
+    let index = load_session_index(&GeminiPaths::from_gemini_dir(&gemini));
+    let elapsed = start.elapsed();
+
+    assert!(
+        index.db_busy,
+        "load_session_index must propagate db_busy when conversation_summaries.db is exclusively locked"
+    );
+    assert!(index.by_id.is_empty());
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "expected retries across busy_timeout and backoff, elapsed={elapsed:?}"
+    );
+
+    lock_conn.execute_batch("COMMIT;").unwrap();
+    drop(lock_conn);
+
+    // Normal missing-table case still returns empty index without db_busy.
+    let tmp_missing = TempDir::new().unwrap();
+    let gemini_missing = tmp_missing.path().join(".gemini");
+    let app_missing = gemini_missing.join("antigravity");
+    std::fs::create_dir_all(&app_missing).unwrap();
+    let missing_db = app_missing.join("conversation_summaries.db");
+    let conn_missing = Connection::open_with_flags(
+        &missing_db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .unwrap();
+    conn_missing
+        .execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY);")
+        .unwrap();
+    drop(conn_missing);
+
+    let missing_index = load_session_index(&GeminiPaths::from_gemini_dir(&gemini_missing));
+    assert!(!missing_index.db_busy);
+    assert!(missing_index.by_id.is_empty());
+}
+
+#[test]
+fn sess_03_summaries_db_recovers_when_lock_released_within_retry_window() {
+    let tmp = TempDir::new().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let app = gemini.join("antigravity");
+    std::fs::create_dir_all(&app).unwrap();
+
+    let conv_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    let sum_db = app.join("conversation_summaries.db");
+    let lock_conn = Connection::open_with_flags(
+        &sum_db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .unwrap();
+    lock_conn
+        .execute_batch(
+            "CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                preview TEXT NOT NULL DEFAULT '',
+                workspace_uris TEXT NOT NULL DEFAULT '',
+                project_id TEXT NOT NULL DEFAULT '',
+                agent_name TEXT NOT NULL DEFAULT '',
+                parent_conversation_id TEXT NOT NULL DEFAULT '',
+                nesting_depth INTEGER NOT NULL DEFAULT 0,
+                last_modified_time TEXT NOT NULL DEFAULT ''
+            );",
+        )
+        .unwrap();
+    lock_conn
+        .execute(
+            "INSERT INTO conversation_summaries VALUES (?1, ?2, '', '', '', '', '', 0, '2026-11-24 10:00:00+00:00')",
+            rusqlite::params![conv_id, "Recovered Summary"],
+        )
+        .unwrap();
+
+    lock_conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        // Exceed first 150ms busy_timeout so at least one retry backoff runs, while staying inside total retry window.
+        std::thread::sleep(Duration::from_millis(200));
+        lock_conn.execute_batch("COMMIT;").unwrap();
+    });
+
+    ready_rx.recv().unwrap();
+    // End-to-end lock-release recovery via public load_session_index without wall-clock assertions;
+    // deterministic SQLITE_BUSY -> retry-backoff synchronization is verified in
+    // sessions::tests::sess_03_deterministic_retry_recovers_after_first_busy_callback.
+    let index = load_session_index(&GeminiPaths::from_gemini_dir(&gemini));
+    handle.join().unwrap();
+
+    assert!(
+        !index.db_busy,
+        "load_session_index should recover once exclusive lock is released within retry window"
+    );
+    assert_eq!(index.by_id.len(), 1);
+    assert_eq!(
+        index.by_id.get(conv_id).map(|s| s.display_title.as_str()),
+        Some("Recovered Summary")
+    );
+}
