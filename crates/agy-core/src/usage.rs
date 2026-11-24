@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Days, Local, NaiveDate};
 
-use crate::analyzer::analyze_conversation_with_meta;
+use crate::analyzer::{CustomizationBreakdown, analyze_conversation_with_meta_and_customizations};
 use crate::fingerprint::{DbFingerprint, TranscriptFingerprint};
 use crate::models::normalize_model_slug;
 use crate::sessions::{SessionIndex, SessionSummary, is_valid_conv_id, parse_datetime_ms};
@@ -321,8 +321,14 @@ fn load_or_analyze_session(
         return Some(cached.metrics.clone());
     }
 
-    let (analysis, model_from_db) =
-        analyze_conversation_with_meta(&summary.app_data_dir, conv_id, None, None).ok()?;
+    let (analysis, model_from_db) = analyze_conversation_with_meta_and_customizations(
+        &summary.app_data_dir,
+        conv_id,
+        None,
+        None,
+        Some(CustomizationBreakdown::default()),
+    )
+    .ok()?;
     if !analysis.found {
         return None;
     }

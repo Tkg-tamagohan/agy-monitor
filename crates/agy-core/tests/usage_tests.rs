@@ -759,3 +759,84 @@ fn usage_07_load_session_index_integration() {
             .any(|r| r.key == "claude-sonnet-4-6" && r.label == "Claude Sonnet 4.6")
     );
 }
+
+#[test]
+fn usage_08_aggregate_usage_with_mock_customizations_on_disk() {
+    let tmp = TempDir::new().unwrap();
+    let gemini_dir = tmp.path().join(".gemini");
+    let app_dir = gemini_dir.join("antigravity");
+    let cli_dir = gemini_dir.join("antigravity-cli");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::create_dir_all(&cli_dir).unwrap();
+
+    // Populate oversized / noisy customization files under .gemini.
+    // Period usage aggregation bypasses customization scanning and stays exact.
+    let mcp_dir = app_dir.join("mcp").join("heavy-mcp");
+    std::fs::create_dir_all(&mcp_dir).unwrap();
+    std::fs::write(mcp_dir.join("instructions.md"), "instruction ".repeat(5000)).unwrap();
+    std::fs::write(app_dir.join("mcp_config.json"), "{ invalid json").unwrap();
+
+    let builtin_skill = app_dir.join("builtin").join("skills").join("heavy-skill");
+    std::fs::create_dir_all(&builtin_skill).unwrap();
+    std::fs::write(builtin_skill.join("SKILL.md"), "skill ".repeat(2000)).unwrap();
+
+    let plugin_rules = gemini_dir
+        .join("config")
+        .join("plugins")
+        .join("demo-plugin")
+        .join("rules");
+    std::fs::create_dir_all(&plugin_rules).unwrap();
+    std::fs::write(plugin_rules.join("always.md"), "rule ".repeat(5000)).unwrap();
+
+    let id_app = "11112222-3333-4444-5555-666677778888";
+    write_conversation_db_model(&app_dir, id_app, "claude-opus-4-6");
+    write_transcript(
+        &app_dir,
+        id_app,
+        &[
+            planner_step(0, 200, 300, 50),
+            checkpoint_step(1),
+            planner_step(2, 100, 400, 75),
+        ],
+    );
+
+    let id_cli = "99998888-7777-6666-5555-444433332222";
+    write_conversation_db_model(&cli_dir, id_cli, "gemini-3.1-pro");
+    write_transcript(&cli_dir, id_cli, &[planner_step(0, 300, 700, 125)]);
+
+    let paths = GeminiPaths::from_gemini_dir(&gemini_dir);
+    let index = load_session_index(&paths);
+    let cancel = AtomicBool::new(false);
+    let mut cache = UsageCache::default();
+
+    let report = aggregate_usage(
+        &index,
+        UsagePeriod::AllTime,
+        DEFAULT_MAX_USAGE_SESSIONS,
+        &mut cache,
+        &cancel,
+    )
+    .unwrap();
+
+    assert_eq!(report.total_sessions, 2);
+    assert_eq!(report.analyzed_sessions, 2);
+    assert_eq!(report.skipped_sessions, 0);
+    assert_eq!(report.total_input_tokens, 2000);
+    assert_eq!(report.total_cached_tokens, 1400);
+    assert_eq!(report.total_output_tokens, 250);
+    assert_eq!(report.total_compactions, 1);
+    assert!((report.cache_hit_ratio - 0.7).abs() < 1e-12);
+    assert_eq!(report.by_surface.len(), 2);
+    assert_eq!(report.by_model.len(), 2);
+    assert!(
+        report.by_model.iter().any(|r| r.key == "claude-opus-4-6"
+            && r.input_tokens == 1000
+            && r.output_tokens == 125)
+    );
+    assert!(
+        report
+            .by_model
+            .iter()
+            .any(|r| r.key == "gemini-3.1-pro" && r.input_tokens == 1000 && r.output_tokens == 125)
+    );
+}
