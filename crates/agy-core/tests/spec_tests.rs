@@ -1872,18 +1872,15 @@ fn sess_03_summaries_db_recovers_when_lock_released_within_retry_window() {
     });
 
     ready_rx.recv().unwrap();
-    let start = Instant::now();
+    // End-to-end lock-release recovery via public load_session_index without wall-clock assertions;
+    // deterministic SQLITE_BUSY -> retry-backoff synchronization is verified in
+    // sessions::tests::sess_03_deterministic_retry_recovers_after_first_busy_callback.
     let index = load_session_index(&GeminiPaths::from_gemini_dir(&gemini));
-    let elapsed = start.elapsed();
     handle.join().unwrap();
 
     assert!(
         !index.db_busy,
         "load_session_index should recover once exclusive lock is released within retry window"
-    );
-    assert!(
-        elapsed >= Duration::from_millis(150),
-        "expected reader to wait/retry past initial lock window, elapsed={elapsed:?}"
     );
     assert_eq!(index.by_id.len(), 1);
     assert_eq!(
