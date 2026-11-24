@@ -20,6 +20,7 @@ pub struct UsageViewState {
     pub sub_tab: Phase2SubTab,
     pub selected_period: UsagePeriod,
     pub project_filter: String,
+    pub selected_project_key: Option<String>,
     pub customization_search: String,
     pub timing_filter: Option<LoadTiming>,
     pub kind_filter: Option<CustomizationKind>,
@@ -31,6 +32,7 @@ impl Default for UsageViewState {
             sub_tab: Phase2SubTab::UsageStats,
             selected_period: UsagePeriod::Last7Days,
             project_filter: String::new(),
+            selected_project_key: None,
             customization_search: String::new(),
             timing_filter: None,
             kind_filter: None,
@@ -152,39 +154,52 @@ fn render_usage_stats_view(
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new("プロジェクト絞込:").color(palette.text_muted));
         let filter_w = (ui.available_width() - 120.0).clamp(80.0, 200.0);
-        ui.add(
+        let input_resp = ui.add(
             egui::TextEdit::singleline(&mut state.project_filter)
                 .id_salt("usage_project_filter_input")
                 .hint_text("名称またはキー")
                 .desired_width(filter_w),
         );
+        if input_resp.changed() {
+            state.selected_project_key = None;
+        }
 
         if let Some(report) = usage_report
             && !report.by_project.is_empty()
         {
             let combo_w = (ui.available_width() - 50.0).clamp(80.0, 160.0);
-            let selected_text = if state.project_filter.is_empty() {
-                "すべて".to_string()
-            } else {
-                report
+            let selected_text = match state.selected_project_key.as_deref() {
+                None => "すべて".to_string(),
+                Some(key) => report
                     .by_project
                     .iter()
-                    .find(|r| r.key == state.project_filter || r.label == state.project_filter)
+                    .find(|r| r.key == key)
                     .map(|r| truncate_ui(&r.label, 18))
-                    .unwrap_or_else(|| truncate_ui(&state.project_filter, 18))
+                    .unwrap_or_else(|| truncate_ui(key, 18)),
             };
+            let prev_selected = state.selected_project_key.clone();
             egui::ComboBox::from_id_salt("usage_project_selector")
                 .width(combo_w)
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut state.project_filter, String::new(), "すべて");
+                    ui.selectable_value(&mut state.selected_project_key, None, "すべて");
                     for row in &report.by_project {
-                        ui.selectable_value(&mut state.project_filter, row.key.clone(), &row.label);
+                        ui.selectable_value(
+                            &mut state.selected_project_key,
+                            Some(row.key.clone()),
+                            &row.label,
+                        );
                     }
                 });
+            if state.selected_project_key != prev_selected {
+                state.project_filter.clear();
+            }
         }
 
-        if !state.project_filter.is_empty() && ui.small_button("クリア").clicked() {
+        if (state.selected_project_key.is_some() || !state.project_filter.is_empty())
+            && ui.small_button("クリア").clicked()
+        {
+            state.selected_project_key = None;
             state.project_filter.clear();
         }
     });
@@ -247,6 +262,7 @@ fn render_usage_stats_view(
         "モデル",
         "usage_model_table",
         &report.by_model,
+        None,
         "",
         palette,
     );
@@ -258,6 +274,7 @@ fn render_usage_stats_view(
         "プロジェクト",
         "usage_project_table",
         &report.by_project,
+        state.selected_project_key.as_deref(),
         &state.project_filter,
         palette,
     );
@@ -269,6 +286,7 @@ fn render_usage_stats_view(
         "サーフェス",
         "usage_surface_table",
         &report.by_surface,
+        None,
         "",
         palette,
     );
@@ -560,27 +578,37 @@ fn render_daily_plot(ui: &mut egui::Ui, daily: &[DailyUsagePoint], palette: &Pal
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_breakdown_table(
     ui: &mut egui::Ui,
     title: &str,
     key_col_header: &str,
     id_salt: &str,
     rows: &[UsageBreakdownRow],
+    selected_project_key: Option<&str>,
     project_filter: &str,
     palette: &Palette,
 ) {
-    let query = project_filter.trim().to_lowercase();
-    let matched_count = if query.is_empty() {
+    let selected_key = selected_project_key
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let query = if selected_key.is_some() {
+        String::new()
+    } else {
+        project_filter.trim().to_lowercase()
+    };
+    let has_filter = selected_key.is_some() || !query.is_empty();
+    let matched_count = if !has_filter {
         rows.len()
     } else {
         rows.iter()
-            .filter(|r| row_matches_filter(r, &query))
+            .filter(|r| row_matches_project_filter(r, selected_key, &query))
             .count()
     };
 
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(title).strong());
-        if !query.is_empty() {
+        if has_filter {
             ui.label(
                 egui::RichText::new(format!("(一致 {matched_count} / {} 件)", rows.len()))
                     .small()
@@ -598,7 +626,7 @@ fn render_breakdown_table(
         return;
     }
 
-    if !query.is_empty() && matched_count == 0 {
+    if has_filter && matched_count == 0 {
         ui.label(
             egui::RichText::new("一致する項目はありません")
                 .small()
@@ -625,8 +653,9 @@ fn render_breakdown_table(
                     ui.end_row();
 
                     for row in rows {
-                        let is_match = !query.is_empty() && row_matches_filter(row, &query);
-                        if !query.is_empty() && !is_match {
+                        let is_match =
+                            has_filter && row_matches_project_filter(row, selected_key, &query);
+                        if has_filter && !is_match {
                             continue;
                         }
                         let label_text = if row.label.is_empty() {
@@ -977,6 +1006,20 @@ fn kpi_card(
 
 fn row_matches_filter(row: &UsageBreakdownRow, query_lower: &str) -> bool {
     row.key.to_lowercase().contains(query_lower) || row.label.to_lowercase().contains(query_lower)
+}
+
+fn row_matches_project_filter(
+    row: &UsageBreakdownRow,
+    selected_key: Option<&str>,
+    query_lower: &str,
+) -> bool {
+    if let Some(key) = selected_key {
+        row.key == key
+    } else if query_lower.is_empty() {
+        true
+    } else {
+        row_matches_filter(row, query_lower)
+    }
 }
 
 fn item_matches_filters(item: &CustomizationItem, state: &UsageViewState) -> bool {
@@ -1736,5 +1779,115 @@ mod tests {
             ),
             Some("入力\n2026-11-24: 1500".to_string())
         );
+    }
+
+    #[test]
+    fn gui_14_selected_project_key_uses_exact_match_and_excludes_prefix_siblings() {
+        let mut report = sample_usage_report(false);
+        report.by_project = vec![
+            UsageBreakdownRow {
+                key: "path:c:/repo/app".to_string(),
+                label: "app".to_string(),
+                session_count: 2,
+                input_tokens: 100_000,
+                cached_tokens: 50_000,
+                output_tokens: 10_000,
+                compaction_count: 0,
+            },
+            UsageBreakdownRow {
+                key: "path:c:/repo/app-tools".to_string(),
+                label: "app-tools".to_string(),
+                session_count: 5,
+                input_tokens: 250_000,
+                cached_tokens: 120_000,
+                output_tokens: 25_000,
+                compaction_count: 1,
+            },
+        ];
+
+        // Direct matcher check: exact key match excludes prefix sibling, substring allows both.
+        assert!(row_matches_project_filter(
+            &report.by_project[0],
+            Some("path:c:/repo/app"),
+            ""
+        ));
+        assert!(!row_matches_project_filter(
+            &report.by_project[1],
+            Some("path:c:/repo/app"),
+            ""
+        ));
+        assert!(row_matches_project_filter(
+            &report.by_project[0],
+            None,
+            "app"
+        ));
+        assert!(row_matches_project_filter(
+            &report.by_project[1],
+            None,
+            "app"
+        ));
+
+        let ctx = egui::Context::default();
+        install_japanese_fonts(&ctx);
+        apply_theme(&ctx, ThemeMode::Dark);
+        let palette = Palette::for_mode(ThemeMode::Dark);
+        let viewport = egui::vec2(520.0, 1100.0);
+
+        let run_frame = |state: &mut UsageViewState, label: &str| {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw_input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let _ =
+                        render_usage_phase2(ui, state, Some(&report), false, None, false, &palette);
+                });
+            });
+            assert_clips_within_viewport(&output.shapes, viewport.x, viewport.y, label);
+            let texts = collect_rendered_texts(&output.shapes);
+            output.textures_delta.clear();
+            texts
+        };
+
+        // Selected project key from ComboBox must match only exact key.
+        let mut state_exact = UsageViewState {
+            sub_tab: Phase2SubTab::UsageStats,
+            selected_project_key: Some("path:c:/repo/app".to_string()),
+            project_filter: String::new(),
+            ..Default::default()
+        };
+        let _ = run_frame(&mut state_exact, "gui_14_exact_warmup");
+        let texts_exact = run_frame(&mut state_exact, "gui_14_exact");
+        assert!(
+            texts_exact.iter().any(|(t, _, _)| t == "(一致 1 / 2 件)"),
+            "exact project selection must match only 1 of 2 projects"
+        );
+        assert!(
+            texts_exact.iter().any(|(t, _, _)| t == "100.0k"),
+            "selected project (app / 100.0k) must be rendered"
+        );
+        assert!(
+            !texts_exact
+                .iter()
+                .any(|(t, _, _)| t == "app-tools" || t == "250.0k"),
+            "prefix sibling project (app-tools / 250.0k) must be excluded"
+        );
+
+        // Free-text query without selected_project_key keeps substring matching.
+        let mut state_sub = UsageViewState {
+            sub_tab: Phase2SubTab::UsageStats,
+            selected_project_key: None,
+            project_filter: "app".to_string(),
+            ..Default::default()
+        };
+        let _ = run_frame(&mut state_sub, "gui_14_sub_warmup");
+        let texts_sub = run_frame(&mut state_sub, "gui_14_sub");
+        assert!(
+            texts_sub.iter().any(|(t, _, _)| t == "(一致 2 / 2 件)"),
+            "free-text filter 'app' should match both projects"
+        );
+        assert!(texts_sub.iter().any(|(t, _, _)| t == "100.0k"));
+        assert!(texts_sub.iter().any(|(t, _, _)| t == "250.0k"));
     }
 }

@@ -673,3 +673,88 @@ Body.
             && i.timing == LoadTiming::Deferred
     }));
 }
+
+#[test]
+fn cust_08_trigger_always_on_with_description_is_always() {
+    let tmp = TempDir::new().unwrap();
+    let g = tmp.path();
+    let rules_dir = g.join("config").join("plugins").join("p1").join("rules");
+
+    let always_on_body = "\
+---
+trigger: always_on
+description: Applied every turn even with description
+---
+Always on rule body.
+";
+    let always_short_body = "\
+---
+trigger: always
+description: Short trigger alias with description
+---
+Always short rule body.
+";
+    let model_decision_body = "\
+---
+trigger: model_decision
+description: Conditional rule triggered by model decision
+---
+Model decision rule body.
+";
+    let explicit_false_body = "\
+---
+alwaysApply: false
+trigger: always_on
+description: Explicit alwaysApply false wins over trigger
+---
+Explicit false rule body.
+";
+
+    write_file(
+        &rules_dir.join("always_on_desc.md"),
+        always_on_body.as_bytes(),
+    );
+    write_file(
+        &rules_dir.join("always_desc.md"),
+        always_short_body.as_bytes(),
+    );
+    write_file(
+        &rules_dir.join("model_decision_desc.md"),
+        model_decision_body.as_bytes(),
+    );
+    write_file(
+        &rules_dir.join("explicit_false.md"),
+        explicit_false_body.as_bytes(),
+    );
+
+    let inv = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    assert!(inv.scan_warnings.is_empty());
+
+    let find_rule = |name: &str| {
+        inv.items
+            .iter()
+            .find(|i| i.kind == CustomizationKind::RuleFile && i.name == name)
+            .unwrap_or_else(|| panic!("missing rule {name}"))
+    };
+
+    let r_always_on = find_rule("always_on_desc");
+    assert_eq!(r_always_on.timing, LoadTiming::Always);
+
+    let r_always = find_rule("always_desc");
+    assert_eq!(r_always.timing, LoadTiming::Always);
+
+    let r_model = find_rule("model_decision_desc");
+    assert_eq!(r_model.timing, LoadTiming::Deferred);
+
+    let r_false = find_rule("explicit_false");
+    assert_eq!(r_false.timing, LoadTiming::Deferred);
+
+    assert_eq!(
+        inv.breakdown.rules_files,
+        r_always_on.estimated_tokens + r_always.estimated_tokens
+    );
+    assert_eq!(
+        sum_items(&inv, CustomizationKind::RuleFile, LoadTiming::Deferred),
+        r_model.estimated_tokens + r_false.estimated_tokens
+    );
+}

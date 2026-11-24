@@ -1121,12 +1121,21 @@ fn classify_rule_timing(fm_opt: Option<&Frontmatter<'_>>) -> LoadTiming {
     if fm.always_apply == Some(true) {
         return LoadTiming::Always;
     }
-    let has_conditional_trigger = fm.has_globs
-        || fm.has_paths
-        || fm.has_description
-        || fm.trigger.as_deref().is_some_and(|t| {
-            !t.eq_ignore_ascii_case("always_on") && !t.eq_ignore_ascii_case("always")
-        });
+    if let Some(trigger) = fm
+        .trigger
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return if trigger.eq_ignore_ascii_case("always_on")
+            || trigger.eq_ignore_ascii_case("always")
+        {
+            LoadTiming::Always
+        } else {
+            LoadTiming::Deferred
+        };
+    }
+    let has_conditional_trigger = fm.has_globs || fm.has_paths || fm.has_description;
     if has_conditional_trigger {
         LoadTiming::Deferred
     } else {

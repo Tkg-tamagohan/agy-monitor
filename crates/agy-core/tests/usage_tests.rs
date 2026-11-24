@@ -840,3 +840,126 @@ fn usage_08_aggregate_usage_with_mock_customizations_on_disk() {
             .any(|r| r.key == "gemini-3.1-pro" && r.input_tokens == 1000 && r.output_tokens == 125)
     );
 }
+
+#[test]
+fn usage_09_model_breakdown_ignores_pbtxt_fallback_when_db_model_missing() {
+    let tmp = TempDir::new().unwrap();
+    let app_dir = tmp.path().join(".gemini").join("antigravity");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let pbtxt_path = app_dir.join("antigravity_state.pbtxt");
+    std::fs::write(
+        &pbtxt_path,
+        "last_selected_agent_model: MODEL_PLACEHOLDER_M26\n",
+    )
+    .unwrap();
+
+    // Session without DB model info and empty summary label
+    let id_missing_db = "10101010-2020-3030-4040-505050505050";
+    write_transcript(&app_dir, id_missing_db, &[planner_step(0, 100, 300, 40)]);
+
+    // Session without DB model info and "Default model" summary label
+    let id_default_label = "20202020-3030-4040-5050-606060606060";
+    write_transcript(&app_dir, id_default_label, &[planner_step(0, 200, 400, 60)]);
+
+    // Control session with DB model info
+    let id_with_db = "30303030-4040-5050-6060-707070707070";
+    write_conversation_db_model(&app_dir, id_with_db, "gemini-3.1-pro");
+    write_transcript(&app_dir, id_with_db, &[planner_step(0, 50, 150, 20)]);
+
+    let mut s1 = make_summary(
+        id_missing_db,
+        Surface::App,
+        &app_dir,
+        "path:c:/repo/alpha",
+        "alpha",
+        1_000,
+    );
+    s1.model_label = String::new();
+
+    let mut s2 = make_summary(
+        id_default_label,
+        Surface::App,
+        &app_dir,
+        "path:c:/repo/alpha",
+        "alpha",
+        2_000,
+    );
+    s2.model_label = "Default model".to_string();
+
+    let s3 = make_summary(
+        id_with_db,
+        Surface::App,
+        &app_dir,
+        "path:c:/repo/alpha",
+        "alpha",
+        3_000,
+    );
+
+    let mut by_id = HashMap::new();
+    by_id.insert(id_missing_db.to_string(), s1);
+    by_id.insert(id_default_label.to_string(), s2);
+    by_id.insert(id_with_db.to_string(), s3);
+
+    let index = SessionIndex {
+        by_id,
+        ..Default::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let mut cache = UsageCache::default();
+
+    let report1 = aggregate_usage(
+        &index,
+        UsagePeriod::AllTime,
+        DEFAULT_MAX_USAGE_SESSIONS,
+        &mut cache,
+        &cancel,
+    )
+    .unwrap();
+
+    assert_eq!(report1.by_model.len(), 2);
+    let unknown1 = report1
+        .by_model
+        .iter()
+        .find(|r| r.key == "unknown")
+        .expect("unknown bucket must exist");
+    assert_eq!(unknown1.label, "不明");
+    assert_eq!(unknown1.session_count, 2);
+    assert_eq!(unknown1.input_tokens, 1000);
+    assert_eq!(unknown1.cached_tokens, 700);
+    assert_eq!(unknown1.output_tokens, 100);
+    assert!(
+        !report1
+            .by_model
+            .iter()
+            .any(|r| r.key.contains("claude") || r.label.contains("Claude")),
+        "pbtxt fallback model must not leak into period model breakdown"
+    );
+
+    // Change antigravity_state.pbtxt and re-aggregate both with warm cache and fresh cache.
+    std::fs::write(
+        &pbtxt_path,
+        "last_selected_agent_model: MODEL_PLACEHOLDER_M35\n",
+    )
+    .unwrap();
+
+    let report_cached = aggregate_usage(
+        &index,
+        UsagePeriod::AllTime,
+        DEFAULT_MAX_USAGE_SESSIONS,
+        &mut cache,
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(report_cached.by_model, report1.by_model);
+
+    let mut fresh_cache = UsageCache::default();
+    let report_fresh = aggregate_usage(
+        &index,
+        UsagePeriod::AllTime,
+        DEFAULT_MAX_USAGE_SESSIONS,
+        &mut fresh_cache,
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(report_fresh.by_model, report1.by_model);
+}

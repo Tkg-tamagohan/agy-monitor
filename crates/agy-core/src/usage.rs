@@ -391,12 +391,6 @@ fn resolve_model_display(
         };
         return (key, summary_trimmed.to_string());
     }
-    if !analysis_model_id.is_empty() {
-        return (
-            analysis_model_id.to_string(),
-            analysis_model_label.to_string(),
-        );
-    }
     ("unknown".to_string(), "不明".to_string())
 }
 
