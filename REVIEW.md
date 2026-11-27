@@ -31,7 +31,7 @@
 
 ### 除外対象ファイル
 
-- `Cargo.lock`（依存変更は `Cargo.toml` と `crates/*/Cargo.toml` で確認し、整合性は CI の `--locked` へ委ねる）
+- `Cargo.lock`（通常の依存変更は `Cargo.toml` と `crates/*/Cargo.toml` で確認し、整合性は CI の `--locked` へ委ねる。ただし `Cargo.lock` のみを更新する推移依存の変更は例外として確認対象とする）
 
 ### 指摘を抑える対象
 
