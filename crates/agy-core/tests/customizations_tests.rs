@@ -1376,3 +1376,67 @@ fn cust_13_stat_probe_exact_boundary_keeps_8000th_and_warns_distinctly() {
         inv.scan_warnings
     );
 }
+
+/// CUST-14: When both MAX_SCAN_FILES (2,000) and MAX_STAT_PROBES (8,000) are reached
+/// simultaneously, only a single scan-limit warning is emitted (preferring file limit).
+#[test]
+fn cust_14_simultaneous_file_and_stat_limits_emit_single_warning() {
+    let tmp = TempDir::new().unwrap();
+    let g = tmp.path();
+
+    let plugins_dir = g.join("config").join("plugins");
+    fs::create_dir_all(&plugins_dir).unwrap();
+    for i in 0..1499 {
+        fs::create_dir_all(plugins_dir.join(format!("p_{i:04}"))).unwrap();
+    }
+    write_file(
+        &plugins_dir.join("p_0000").join("mcp_config.json"),
+        br#"{"mcpServers":{}}"#,
+    );
+    write_file(
+        &plugins_dir.join("p_0001").join("mcp_config.json"),
+        br#"{"mcpServers":{}}"#,
+    );
+    write_file(
+        &plugins_dir.join("p_0000").join("rules").join("extra.md"),
+        b"# Extra Rule\n",
+    );
+
+    let srv_dir = g.join("antigravity").join("mcp").join("srv");
+    fs::create_dir_all(&srv_dir).unwrap();
+    for i in 0..1998 {
+        fs::write(srv_dir.join(format!("t_{i:04}.json")), br#"{"name":"x"}"#).unwrap();
+    }
+    write_file(
+        &g.join("antigravity")
+            .join("builtin")
+            .join("skills")
+            .join("extra")
+            .join("SKILL.md"),
+        b"---\nname: extra\ndescription: Extra skill\n---\nBody.\n",
+    );
+
+    let inv = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    let mcp_tool_count = inv
+        .items
+        .iter()
+        .filter(|i| i.kind == CustomizationKind::McpTool)
+        .count();
+    assert_eq!(mcp_tool_count, 1998);
+    assert_eq!(
+        inv.scan_warnings.len(),
+        1,
+        "expected exactly one limit warning, got: {:?}",
+        inv.scan_warnings
+    );
+    assert!(
+        inv.scan_warnings[0].contains(&format!("scan file limit reached ({MAX_SCAN_FILES})")),
+        "expected file limit warning when both limits hit, got: {:?}",
+        inv.scan_warnings
+    );
+    assert!(
+        !inv.scan_warnings[0].contains("scan stat probe limit reached"),
+        "must not emit stat probe limit warning alongside file limit: {:?}",
+        inv.scan_warnings
+    );
+}

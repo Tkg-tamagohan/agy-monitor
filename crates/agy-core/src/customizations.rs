@@ -238,8 +238,7 @@ struct ScanContext<'a> {
     warnings: Vec<String>,
     files_scanned: usize,
     stat_probes: usize,
-    file_limit_warned: bool,
-    stat_limit_warned: bool,
+    scan_limit_warned: bool,
 }
 
 impl<'a> ScanContext<'a> {
@@ -255,8 +254,7 @@ impl<'a> ScanContext<'a> {
             warnings: Vec::new(),
             files_scanned: 0,
             stat_probes: 0,
-            file_limit_warned: false,
-            stat_limit_warned: false,
+            scan_limit_warned: false,
         }
     }
 
@@ -326,8 +324,8 @@ impl<'a> ScanContext<'a> {
     }
 
     fn warn_file_limit_once(&mut self) {
-        if !self.file_limit_warned {
-            self.file_limit_warned = true;
+        if !self.scan_limit_warned {
+            self.scan_limit_warned = true;
             self.push_warning(format!(
                 "scan file limit reached ({MAX_SCAN_FILES}); remaining files skipped"
             ));
@@ -335,8 +333,8 @@ impl<'a> ScanContext<'a> {
     }
 
     fn warn_stat_limit_once(&mut self) {
-        if !self.stat_limit_warned {
-            self.stat_limit_warned = true;
+        if !self.scan_limit_warned {
+            self.scan_limit_warned = true;
             self.push_warning(format!(
                 "scan stat probe limit reached ({MAX_STAT_PROBES}); remaining entries skipped"
             ));
@@ -345,7 +343,11 @@ impl<'a> ScanContext<'a> {
 
     fn try_reserve_stat_probe(&mut self) -> bool {
         if self.stat_limit_reached() {
-            self.warn_stat_limit_once();
+            if self.file_limit_reached() {
+                self.warn_file_limit_once();
+            } else {
+                self.warn_stat_limit_once();
+            }
             false
         } else {
             self.stat_probes += 1;
