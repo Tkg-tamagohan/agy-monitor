@@ -1020,6 +1020,10 @@ fn cust_10_mcp_eager_precedence_and_legacy_lazy_compat() {
     let legacy_lazy = r#"{"name":"legacy_lazy","lazy":true,"description":"Legacy lazy stays Deferred despite eager:true"}"#;
     let legacy_defer = r#"{"name":"legacy_defer","defer":true,"description":"Legacy defer stays Deferred despite eager:true"}"#;
     let stem_fallback = r#"{"description":"Tool without JSON name matched by file stem"}"#;
+    let alias_off_by_stem = r#"{"name":"alias_name","description":"Plugin sets name=true, antigravity root sets stem=false"}"#;
+    let alias_on_by_name = r#"{"name":"alias2_name","description":"Plugin sets stem=false, antigravity root sets name=true"}"#;
+    let tie_same_prec =
+        r#"{"name":"tie_name","description":"Same precedence prefers JSON name over file stem"}"#;
 
     write_file(
         &plug_srv.join("overridden_off.json"),
@@ -1035,8 +1039,18 @@ fn cust_10_mcp_eager_precedence_and_legacy_lazy_compat() {
         &plug_srv.join("stem_fallback.json"),
         stem_fallback.as_bytes(),
     );
+    write_file(
+        &plug_srv.join("alias_file.json"),
+        alias_off_by_stem.as_bytes(),
+    );
+    write_file(
+        &plug_srv.join("alias2_file.json"),
+        alias_on_by_name.as_bytes(),
+    );
+    write_file(&plug_srv.join("tie_file.json"), tie_same_prec.as_bytes());
 
-    // Precedence 0 (Plugin): sets overridden_off=true, legacy_lazy=true, legacy_defer=true, stem_fallback=true
+    // Precedence 0 (Plugin): sets overridden_off=true, legacy_lazy=true, legacy_defer=true,
+    // stem_fallback=true, alias_name=true, alias2_file=false, and tie_name=true vs tie_file=false.
     write_file(
         &g.join("config")
             .join("plugins")
@@ -1049,7 +1063,11 @@ fn cust_10_mcp_eager_precedence_and_legacy_lazy_compat() {
                         "overridden_off": { "eager": true },
                         "legacy_lazy": { "eager": true },
                         "legacy_defer": { "eager": true },
-                        "stem_fallback": { "eager": true }
+                        "stem_fallback": { "eager": true },
+                        "alias_name": { "eager": true },
+                        "alias2_file": { "eager": false },
+                        "tie_name": { "eager": true },
+                        "tie_file": { "eager": false }
                     }
                 }
             }
@@ -1070,7 +1088,7 @@ fn cust_10_mcp_eager_precedence_and_legacy_lazy_compat() {
         }"#,
     );
 
-    // Precedence 2 (antigravity/mcp_config.json): overrides overridden_off=false and overridden_on=true
+    // Precedence 2 (antigravity/mcp_config.json): overrides across name and file_stem keys
     write_file(
         &g.join("antigravity").join("mcp_config.json"),
         br#"{
@@ -1078,7 +1096,9 @@ fn cust_10_mcp_eager_precedence_and_legacy_lazy_compat() {
                 "my-plug_srv": {
                     "tools": {
                         "overridden_off": { "eager": false },
-                        "overridden_on": { "eager": true }
+                        "overridden_on": { "eager": true },
+                        "alias_file": { "eager": false },
+                        "alias2_name": { "eager": true }
                     }
                 }
             }
@@ -1108,16 +1128,97 @@ fn cust_10_mcp_eager_precedence_and_legacy_lazy_compat() {
     assert_eq!(find_tool("legacy_lazy").timing, LoadTiming::Deferred);
     assert_eq!(find_tool("legacy_defer").timing, LoadTiming::Deferred);
     assert_eq!(find_tool("stem_fallback").timing, LoadTiming::Always);
+    assert_eq!(find_tool("alias_name").timing, LoadTiming::Deferred);
+    assert_eq!(find_tool("alias2_name").timing, LoadTiming::Always);
+    assert_eq!(find_tool("tie_name").timing, LoadTiming::Always);
 
     assert_eq!(inv.breakdown.mcp_instructions, est_text_tokens(instr_body));
     assert_eq!(
         inv.breakdown.mcp_tools,
-        est_text_tokens(overridden_on) + est_text_tokens(stem_fallback)
+        est_text_tokens(overridden_on)
+            + est_text_tokens(stem_fallback)
+            + est_text_tokens(alias_on_by_name)
+            + est_text_tokens(tie_same_prec)
     );
     assert_eq!(
         inv.breakdown.mcp_deferred,
         est_text_tokens(overridden_off)
             + est_text_tokens(legacy_lazy)
             + est_text_tokens(legacy_defer)
+            + est_text_tokens(alias_off_by_stem)
     );
+}
+
+/// CUST-11: Root and plugin MCP config eager flags are loaded before tool schemas
+/// so hitting MAX_SCAN_FILES does not misclassify collected eager tools as Deferred.
+#[test]
+fn cust_11_mcp_eager_classification_survives_max_scan_files() {
+    let tmp = TempDir::new().unwrap();
+    let g = tmp.path();
+
+    write_file(
+        &g.join("antigravity").join("mcp_config.json"),
+        br#"{"mcpServers":{"a_eager_srv":{"tools":{"first_tool":{"eager":true}}}}}"#,
+    );
+    write_file(
+        &g.join("config")
+            .join("plugins")
+            .join("p1")
+            .join("mcp_config.json"),
+        br#"{"mcpServers":{"plug_srv":{"tools":{"plug_tool":{"eager":true}}}}}"#,
+    );
+
+    let first_tool = r#"{"name":"first_tool","description":"Root eager tool"}"#;
+    let plug_tool = r#"{"name":"plug_tool","description":"Plugin eager tool"}"#;
+    write_file(
+        &g.join("antigravity")
+            .join("mcp")
+            .join("a_eager_srv")
+            .join("first_tool.json"),
+        first_tool.as_bytes(),
+    );
+    write_file(
+        &g.join("antigravity")
+            .join("mcp")
+            .join("p1_plug_srv")
+            .join("plug_tool.json"),
+        plug_tool.as_bytes(),
+    );
+
+    let many_dir = g.join("antigravity").join("mcp").join("z_many_srv");
+    fs::create_dir_all(&many_dir).unwrap();
+    for i in 0..(MAX_SCAN_FILES + 50) {
+        fs::write(many_dir.join(format!("t_{i:04}.json")), br#"{"name":"x"}"#).unwrap();
+    }
+
+    let inv = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    assert!(
+        inv.scan_warnings
+            .iter()
+            .any(|w| w.contains("scan file limit reached")),
+        "expected scan file limit warning, got: {:?}",
+        inv.scan_warnings
+    );
+
+    let first = inv
+        .items
+        .iter()
+        .find(|i| {
+            i.kind == CustomizationKind::McpTool
+                && i.source == "mcp:a_eager_srv"
+                && i.name == "first_tool"
+        })
+        .expect("first_tool should be scanned before limit");
+    assert_eq!(first.timing, LoadTiming::Always);
+
+    let plug = inv
+        .items
+        .iter()
+        .find(|i| {
+            i.kind == CustomizationKind::McpTool
+                && i.source == "mcp:p1_plug_srv"
+                && i.name == "plug_tool"
+        })
+        .expect("plug_tool should be scanned before limit");
+    assert_eq!(plug.timing, LoadTiming::Always);
 }

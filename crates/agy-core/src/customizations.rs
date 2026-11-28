@@ -65,22 +65,14 @@ pub fn scan_customizations_cancellable(
         return None;
     }
 
-    // 1. antigravity/mcp/<server>/ and antigravity/builtin/skills/*/SKILL.md
+    // 1. Root MCP configs (antigravity/mcp_config.json and config/mcp_config.json)
+    // Read before large directories so MAX_SCAN_FILES does not skip eager flags.
     let antigravity_dir = paths.gemini_dir.join("antigravity");
-    if ctx.enter_dir(&antigravity_dir) {
-        let mcp_dir = antigravity_dir.join("mcp");
-        if ctx.enter_dir(&mcp_dir) && !scan_antigravity_mcp(&mut ctx, &mcp_dir, 2) {
-            return None;
-        }
+    let has_antigravity = ctx.enter_dir(&antigravity_dir);
+    let config_dir = paths.gemini_dir.join("config");
+    let has_config = ctx.enter_dir(&config_dir);
 
-        let builtin_skills_dir = antigravity_dir.join("builtin").join("skills");
-        if ctx.enter_dir(&antigravity_dir.join("builtin"))
-            && ctx.enter_dir(&builtin_skills_dir)
-            && !scan_skills_dir(&mut ctx, &builtin_skills_dir, "builtin", 3)
-        {
-            return None;
-        }
-
+    if has_antigravity {
         let antigravity_mcp_cfg = antigravity_dir.join("mcp_config.json");
         if !scan_mcp_config_file(
             &mut ctx,
@@ -97,14 +89,7 @@ pub fn scan_customizations_cancellable(
         return None;
     }
 
-    // 2. config/plugins/<plugin>/ and config/mcp_config.json
-    let config_dir = paths.gemini_dir.join("config");
-    if ctx.enter_dir(&config_dir) {
-        let plugins_dir = config_dir.join("plugins");
-        if ctx.enter_dir(&plugins_dir) && !scan_plugins_dir(&mut ctx, &plugins_dir, 2) {
-            return None;
-        }
-
+    if has_config {
         let config_mcp_cfg = config_dir.join("mcp_config.json");
         if !scan_mcp_config_file(
             &mut ctx,
@@ -121,6 +106,119 @@ pub fn scan_customizations_cancellable(
         return None;
     }
 
+    // 2. config/plugins/<plugin>/ MCP configs first
+    let plugins_dir = config_dir.join("plugins");
+    let plugin_entries = if has_config && ctx.enter_dir(&plugins_dir) {
+        Some(ctx.read_dir_sorted(&plugins_dir)?)
+    } else {
+        None
+    };
+
+    if let Some(entries) = &plugin_entries {
+        for (plugin_name, plugin_path, ft) in entries {
+            if ctx.is_cancelled() {
+                return None;
+            }
+            if ctx.hit_file_limit() {
+                break;
+            }
+            if !ft.is_dir() {
+                continue;
+            }
+            ctx.plugins.insert(plugin_name.clone());
+            let plugin_depth = 3;
+
+            for mcp_file in [".mcp.json", "mcp_config.json", "mcp.json"] {
+                let path = plugin_path.join(mcp_file);
+                let allow_top_level = mcp_file == ".mcp.json";
+                if !scan_mcp_config_file(
+                    &mut ctx,
+                    &path,
+                    allow_top_level,
+                    Some(plugin_name),
+                    PRECEDENCE_PLUGIN,
+                ) {
+                    return None;
+                }
+            }
+
+            let plugin_mcp_dir = plugin_path.join("mcp");
+            if ctx.enter_dir(&plugin_mcp_dir)
+                && !scan_plugin_mcp_dir(&mut ctx, plugin_name, &plugin_mcp_dir, plugin_depth + 1)
+            {
+                return None;
+            }
+        }
+    }
+
+    if ctx.is_cancelled() {
+        return None;
+    }
+
+    // 3. antigravity/mcp/<server>/ and antigravity/builtin/skills/*/SKILL.md
+    if has_antigravity {
+        let mcp_dir = antigravity_dir.join("mcp");
+        if ctx.enter_dir(&mcp_dir) && !scan_antigravity_mcp(&mut ctx, &mcp_dir, 2) {
+            return None;
+        }
+
+        let builtin_skills_dir = antigravity_dir.join("builtin").join("skills");
+        if ctx.enter_dir(&antigravity_dir.join("builtin"))
+            && ctx.enter_dir(&builtin_skills_dir)
+            && !scan_skills_dir(&mut ctx, &builtin_skills_dir, "builtin", 3)
+        {
+            return None;
+        }
+    }
+
+    if ctx.is_cancelled() {
+        return None;
+    }
+
+    // 4. config/plugins/<plugin>/ rules, skills, agents, and subagents
+    if let Some(entries) = &plugin_entries {
+        for (plugin_name, plugin_path, ft) in entries {
+            if ctx.is_cancelled() {
+                return None;
+            }
+            if ctx.hit_file_limit() {
+                break;
+            }
+            if !ft.is_dir() {
+                continue;
+            }
+            let source = format!("plugin:{plugin_name}");
+            let plugin_depth = 3;
+
+            let rules_dir = plugin_path.join("rules");
+            if ctx.enter_dir(&rules_dir)
+                && !scan_plugin_rules_dir(&mut ctx, &rules_dir, &source, plugin_depth + 1)
+            {
+                return None;
+            }
+
+            let skills_dir = plugin_path.join("skills");
+            if ctx.enter_dir(&skills_dir)
+                && !scan_skills_dir(&mut ctx, &skills_dir, &source, plugin_depth + 1)
+            {
+                return None;
+            }
+
+            for agents_sub in ["agents", "subagents"] {
+                let agents_dir = plugin_path.join(agents_sub);
+                if ctx.enter_dir(&agents_dir)
+                    && !scan_plugin_agents_dir(&mut ctx, &agents_dir, &source, plugin_depth + 1)
+                {
+                    return None;
+                }
+            }
+        }
+    }
+
+    if ctx.is_cancelled() {
+        return None;
+    }
+
     Some(ctx.finish())
 }
 
@@ -128,21 +226,10 @@ const PRECEDENCE_PLUGIN: u8 = 0;
 const PRECEDENCE_CONFIG_ROOT: u8 = 1;
 const PRECEDENCE_ANTIGRAVITY_ROOT: u8 = 2;
 
-struct PendingMcpTool {
-    server_name: String,
-    name: String,
-    file_stem: String,
-    source: String,
-    path: PathBuf,
-    estimated_tokens: u64,
-    explicit_deferred: bool,
-}
-
 struct ScanContext<'a> {
     gemini_dir: &'a Path,
     cancel: &'a AtomicBool,
     items: Vec<CustomizationItem>,
-    pending_mcp_tools: Vec<PendingMcpTool>,
     mcp_tool_eager: HashMap<(String, String), (u8, bool)>,
     breakdown: CustomizationBreakdown,
     mcp_servers: HashSet<String>,
@@ -158,7 +245,6 @@ impl<'a> ScanContext<'a> {
             gemini_dir,
             cancel,
             items: Vec::new(),
-            pending_mcp_tools: Vec::new(),
             mcp_tool_eager: HashMap::new(),
             breakdown: CustomizationBreakdown::default(),
             mcp_servers: HashSet::new(),
@@ -196,20 +282,30 @@ impl<'a> ScanContext<'a> {
         tool_name: &str,
         file_stem: &str,
     ) -> Option<bool> {
-        if let Some((_, eager)) = self
+        let name_entry = self
             .mcp_tool_eager
             .get(&(server_name.to_string(), tool_name.to_string()))
-        {
-            return Some(*eager);
-        }
-        if file_stem != tool_name
-            && let Some((_, eager)) = self
-                .mcp_tool_eager
+            .copied();
+        let stem_entry = if file_stem != tool_name {
+            self.mcp_tool_eager
                 .get(&(server_name.to_string(), file_stem.to_string()))
-        {
-            return Some(*eager);
+                .copied()
+        } else {
+            None
+        };
+
+        match (name_entry, stem_entry) {
+            (Some((np, ne)), Some((sp, se))) => {
+                if sp > np {
+                    Some(se)
+                } else {
+                    Some(ne)
+                }
+            }
+            (Some((_, ne)), None) => Some(ne),
+            (None, Some((_, se))) => Some(se),
+            (None, None) => None,
         }
-        None
     }
 
     fn is_cancelled(&self) -> bool {
@@ -218,6 +314,20 @@ impl<'a> ScanContext<'a> {
 
     fn limit_reached(&self) -> bool {
         self.files_scanned >= MAX_SCAN_FILES
+    }
+
+    fn hit_file_limit(&mut self) -> bool {
+        if self.limit_reached() {
+            if !self.file_limit_warned {
+                self.file_limit_warned = true;
+                self.push_warning(format!(
+                    "scan file limit reached ({MAX_SCAN_FILES}); remaining files skipped"
+                ));
+            }
+            true
+        } else {
+            false
+        }
     }
 
     fn rel_display(&self, path: &Path) -> String {
@@ -345,13 +455,7 @@ impl<'a> ScanContext<'a> {
         if self.is_cancelled() {
             return ReadOutcome::Cancelled;
         }
-        if self.files_scanned >= MAX_SCAN_FILES {
-            if !self.file_limit_warned {
-                self.file_limit_warned = true;
-                self.push_warning(format!(
-                    "scan file limit reached ({MAX_SCAN_FILES}); remaining files skipped"
-                ));
-            }
+        if self.hit_file_limit() {
             return ReadOutcome::LimitReached;
         }
         self.files_scanned += 1;
@@ -417,27 +521,6 @@ impl<'a> ScanContext<'a> {
     }
 
     fn finish(mut self) -> CustomizationInventory {
-        let pending_tools = std::mem::take(&mut self.pending_mcp_tools);
-        for tool in pending_tools {
-            let timing = if tool.explicit_deferred {
-                LoadTiming::Deferred
-            } else if self.lookup_mcp_tool_eager(&tool.server_name, &tool.name, &tool.file_stem)
-                == Some(true)
-            {
-                LoadTiming::Always
-            } else {
-                LoadTiming::Deferred
-            };
-            self.push_item(CustomizationItem {
-                kind: CustomizationKind::McpTool,
-                timing,
-                name: tool.name,
-                source: tool.source,
-                path: tool.path,
-                estimated_tokens: tool.estimated_tokens,
-            });
-        }
-
         self.items.sort_by(|a, b| {
             b.estimated_tokens
                 .cmp(&a.estimated_tokens)
@@ -724,7 +807,7 @@ fn scan_antigravity_mcp(ctx: &mut ScanContext<'_>, mcp_dir: &Path, depth: usize)
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.limit_reached() {
+        if ctx.hit_file_limit() {
             break;
         }
         if !ft.is_dir() {
@@ -759,7 +842,7 @@ fn scan_mcp_server_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.limit_reached() {
+        if ctx.hit_file_limit() {
             break;
         }
         if ft.is_dir() {
@@ -813,15 +896,21 @@ fn scan_mcp_server_dir(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| file_stem.clone());
+            let timing = if explicit_deferred {
+                LoadTiming::Deferred
+            } else if ctx.lookup_mcp_tool_eager(server_name, &name, &file_stem) == Some(true) {
+                LoadTiming::Always
+            } else {
+                LoadTiming::Deferred
+            };
             let estimated_tokens = est_text_tokens(&text);
-            ctx.pending_mcp_tools.push(PendingMcpTool {
-                server_name: server_name.to_string(),
+            ctx.push_item(CustomizationItem {
+                kind: CustomizationKind::McpTool,
+                timing,
                 name,
-                file_stem,
                 source: source.clone(),
                 path,
                 estimated_tokens,
-                explicit_deferred,
             });
         }
     }
@@ -848,7 +937,7 @@ fn scan_skills_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.limit_reached() {
+        if ctx.hit_file_limit() {
             break;
         }
         if !ft.is_dir() {
@@ -918,71 +1007,6 @@ fn scan_skills_dir(
     true
 }
 
-fn scan_plugins_dir(ctx: &mut ScanContext<'_>, plugins_dir: &Path, depth: usize) -> bool {
-    let Some(entries) = ctx.read_dir_sorted(plugins_dir) else {
-        return false;
-    };
-    for (plugin_name, plugin_path, ft) in entries {
-        if ctx.is_cancelled() {
-            return false;
-        }
-        if ctx.limit_reached() {
-            break;
-        }
-        if !ft.is_dir() {
-            continue;
-        }
-        ctx.plugins.insert(plugin_name.clone());
-        let source = format!("plugin:{plugin_name}");
-        let plugin_depth = depth + 1;
-
-        let rules_dir = plugin_path.join("rules");
-        if ctx.enter_dir(&rules_dir)
-            && !scan_plugin_rules_dir(ctx, &rules_dir, &source, plugin_depth + 1)
-        {
-            return false;
-        }
-
-        let skills_dir = plugin_path.join("skills");
-        if ctx.enter_dir(&skills_dir)
-            && !scan_skills_dir(ctx, &skills_dir, &source, plugin_depth + 1)
-        {
-            return false;
-        }
-
-        for agents_sub in ["agents", "subagents"] {
-            let agents_dir = plugin_path.join(agents_sub);
-            if ctx.enter_dir(&agents_dir)
-                && !scan_plugin_agents_dir(ctx, &agents_dir, &source, plugin_depth + 1)
-            {
-                return false;
-            }
-        }
-
-        for mcp_file in [".mcp.json", "mcp_config.json", "mcp.json"] {
-            let path = plugin_path.join(mcp_file);
-            let allow_top_level = mcp_file == ".mcp.json";
-            if !scan_mcp_config_file(
-                ctx,
-                &path,
-                allow_top_level,
-                Some(&plugin_name),
-                PRECEDENCE_PLUGIN,
-            ) {
-                return false;
-            }
-        }
-
-        let plugin_mcp_dir = plugin_path.join("mcp");
-        if ctx.enter_dir(&plugin_mcp_dir)
-            && !scan_plugin_mcp_dir(ctx, &plugin_name, &plugin_mcp_dir, plugin_depth + 1)
-        {
-            return false;
-        }
-    }
-    true
-}
-
 fn scan_plugin_rules_dir(
     ctx: &mut ScanContext<'_>,
     dir: &Path,
@@ -1003,7 +1027,7 @@ fn scan_plugin_rules_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.limit_reached() {
+        if ctx.hit_file_limit() {
             break;
         }
         if ft.is_dir() {
@@ -1060,7 +1084,7 @@ fn scan_plugin_agents_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.limit_reached() {
+        if ctx.hit_file_limit() {
             break;
         }
         if ft.is_dir() {
@@ -1124,7 +1148,7 @@ fn scan_plugin_mcp_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.limit_reached() {
+        if ctx.hit_file_limit() {
             break;
         }
         if ft.is_file() {
