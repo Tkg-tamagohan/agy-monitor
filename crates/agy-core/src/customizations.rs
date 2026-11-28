@@ -225,6 +225,7 @@ pub fn scan_customizations_cancellable(
 const PRECEDENCE_PLUGIN: u8 = 0;
 const PRECEDENCE_CONFIG_ROOT: u8 = 1;
 const PRECEDENCE_ANTIGRAVITY_ROOT: u8 = 2;
+const MAX_STAT_PROBES: usize = MAX_SCAN_FILES * 4;
 
 struct ScanContext<'a> {
     gemini_dir: &'a Path,
@@ -236,6 +237,7 @@ struct ScanContext<'a> {
     plugins: HashSet<String>,
     warnings: Vec<String>,
     files_scanned: usize,
+    stat_probes: usize,
     file_limit_warned: bool,
 }
 
@@ -251,6 +253,7 @@ impl<'a> ScanContext<'a> {
             plugins: HashSet::new(),
             warnings: Vec::new(),
             files_scanned: 0,
+            stat_probes: 0,
             file_limit_warned: false,
         }
     }
@@ -313,17 +316,21 @@ impl<'a> ScanContext<'a> {
     }
 
     fn limit_reached(&self) -> bool {
-        self.files_scanned >= MAX_SCAN_FILES
+        self.files_scanned >= MAX_SCAN_FILES || self.stat_probes >= MAX_STAT_PROBES
+    }
+
+    fn warn_file_limit_once(&mut self) {
+        if !self.file_limit_warned {
+            self.file_limit_warned = true;
+            self.push_warning(format!(
+                "scan file limit reached ({MAX_SCAN_FILES}); remaining files skipped"
+            ));
+        }
     }
 
     fn hit_file_limit(&mut self) -> bool {
         if self.limit_reached() {
-            if !self.file_limit_warned {
-                self.file_limit_warned = true;
-                self.push_warning(format!(
-                    "scan file limit reached ({MAX_SCAN_FILES}); remaining files skipped"
-                ));
-            }
+            self.warn_file_limit_once();
             true
         } else {
             false
@@ -377,11 +384,19 @@ impl<'a> ScanContext<'a> {
     }
 
     fn enter_dir(&mut self, path: &Path) -> bool {
-        if self.is_cancelled() || self.limit_reached() {
+        if self.is_cancelled() {
             return false;
         }
+        if self.stat_probes >= MAX_STAT_PROBES {
+            self.warn_file_limit_once();
+            return false;
+        }
+        self.stat_probes += 1;
         match std::fs::symlink_metadata(path) {
             Ok(meta) => {
+                if self.hit_file_limit() {
+                    return false;
+                }
                 if meta.file_type().is_symlink() {
                     let rel = self.rel_display(path);
                     self.push_warning(format!("{rel}: skipped symlink directory"));
@@ -391,11 +406,13 @@ impl<'a> ScanContext<'a> {
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
             Err(err) => {
-                let rel = self.rel_display(path);
-                self.push_warning(format!(
-                    "{rel}: failed to stat directory ({:?})",
-                    err.kind()
-                ));
+                if !self.limit_reached() {
+                    let rel = self.rel_display(path);
+                    self.push_warning(format!(
+                        "{rel}: failed to stat directory ({:?})",
+                        err.kind()
+                    ));
+                }
                 false
             }
         }
@@ -455,20 +472,30 @@ impl<'a> ScanContext<'a> {
         if self.is_cancelled() {
             return ReadOutcome::Cancelled;
         }
-        if self.hit_file_limit() {
+        if self.stat_probes >= MAX_STAT_PROBES {
+            self.warn_file_limit_once();
             return ReadOutcome::LimitReached;
         }
-        self.files_scanned += 1;
+        self.stat_probes += 1;
 
         let meta = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return ReadOutcome::Missing,
             Err(err) => {
+                if self.hit_file_limit() {
+                    return ReadOutcome::LimitReached;
+                }
+                self.files_scanned += 1;
                 let rel = self.rel_display(path);
                 self.push_warning(format!("{rel}: failed to stat file ({:?})", err.kind()));
                 return ReadOutcome::Skipped;
             }
         };
+
+        if self.hit_file_limit() {
+            return ReadOutcome::LimitReached;
+        }
+        self.files_scanned += 1;
 
         if meta.file_type().is_symlink() {
             let rel = self.rel_display(path);

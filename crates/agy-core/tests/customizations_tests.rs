@@ -1222,3 +1222,86 @@ fn cust_11_mcp_eager_classification_survives_max_scan_files() {
         .expect("plug_tool should be scanned before limit");
     assert_eq!(plug.timing, LoadTiming::Always);
 }
+
+/// CUST-12: Missing optional MCP config files do not consume MAX_SCAN_FILES budget,
+/// allowing exact-limit real files (tools + builtin skill) without silent omission, while
+/// exceeding the limit on an existing directory triggers the scan-limit warning.
+#[test]
+fn cust_12_missing_optional_mcp_configs_do_not_consume_file_limit() {
+    // 1. Exactly MAX_SCAN_FILES real files (1999 MCP tools + 1 builtin skill) with no mcp_config.json / config/
+    let tmp_exact = TempDir::new().unwrap();
+    let g_exact = tmp_exact.path();
+    let srv_dir = g_exact.join("antigravity").join("mcp").join("srv");
+    fs::create_dir_all(&srv_dir).unwrap();
+    for i in 0..(MAX_SCAN_FILES - 1) {
+        fs::write(srv_dir.join(format!("t_{i:04}.json")), br#"{"name":"x"}"#).unwrap();
+    }
+    write_file(
+        &g_exact
+            .join("antigravity")
+            .join("builtin")
+            .join("skills")
+            .join("exact_skill")
+            .join("SKILL.md"),
+        b"---\nname: exact_skill\ndescription: Exact limit skill\n---\nBody.\n",
+    );
+
+    let inv_exact = scan_customizations(&GeminiPaths::from_gemini_dir(g_exact));
+    assert!(
+        inv_exact.scan_warnings.is_empty(),
+        "unexpected warnings at exact MAX_SCAN_FILES: {:?}",
+        inv_exact.scan_warnings
+    );
+    assert!(
+        inv_exact.items.iter().any(|i| {
+            i.kind == CustomizationKind::SkillIndex
+                && i.timing == LoadTiming::Always
+                && i.name == "exact_skill"
+                && i.source == "builtin"
+        }),
+        "builtin skill should not be dropped when optional mcp_config.json is absent"
+    );
+    assert_eq!(
+        inv_exact
+            .items
+            .iter()
+            .filter(|i| i.kind == CustomizationKind::McpTool)
+            .count(),
+        MAX_SCAN_FILES - 1
+    );
+
+    // 2. MAX_SCAN_FILES tools (2000) + existing builtin/skills/exact_skill -> enter_dir hits limit with warning
+    let tmp_over = TempDir::new().unwrap();
+    let g_over = tmp_over.path();
+    let srv_over = g_over.join("antigravity").join("mcp").join("srv");
+    fs::create_dir_all(&srv_over).unwrap();
+    for i in 0..MAX_SCAN_FILES {
+        fs::write(srv_over.join(format!("t_{i:04}.json")), br#"{"name":"x"}"#).unwrap();
+    }
+    write_file(
+        &g_over
+            .join("antigravity")
+            .join("builtin")
+            .join("skills")
+            .join("exact_skill")
+            .join("SKILL.md"),
+        b"---\nname: exact_skill\ndescription: Over limit skill\n---\nBody.\n",
+    );
+
+    let inv_over = scan_customizations(&GeminiPaths::from_gemini_dir(g_over));
+    assert!(
+        inv_over
+            .scan_warnings
+            .iter()
+            .any(|w| w.contains("scan file limit reached")),
+        "expected scan file limit warning when builtin dir is skipped, got: {:?}",
+        inv_over.scan_warnings
+    );
+    assert!(
+        !inv_over
+            .items
+            .iter()
+            .any(|i| i.kind == CustomizationKind::SkillIndex && i.name == "exact_skill"),
+        "skill beyond MAX_SCAN_FILES should be skipped"
+    );
+}
