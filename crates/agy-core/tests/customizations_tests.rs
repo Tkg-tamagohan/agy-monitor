@@ -5,7 +5,8 @@ use std::sync::atomic::AtomicBool;
 use agy_core::analyzer::est_text_tokens;
 use agy_core::customizations::{
     CustomizationInventory, CustomizationKind, LoadTiming, MAX_FILE_BYTES, MAX_SCAN_DEPTH,
-    MAX_SCAN_FILES, MAX_WARNINGS, scan_customizations, scan_customizations_cancellable,
+    MAX_SCAN_FILES, MAX_STAT_PROBES, MAX_WARNINGS, scan_customizations,
+    scan_customizations_cancellable,
 };
 use agy_core::paths::GeminiPaths;
 use tempfile::TempDir;
@@ -42,6 +43,13 @@ fn cust_01_full_mock_tree_and_breakdown_sums() {
     write_file(
         &mcp_srv1.join("alpha_search.json"),
         eager_tool_json.as_bytes(),
+    );
+
+    let default_lazy_tool_json =
+        r#"{"name":"alpha_default_lazy","description":"Default lazy tool without eager flag"}"#;
+    write_file(
+        &mcp_srv1.join("alpha_default_lazy.json"),
+        default_lazy_tool_json.as_bytes(),
     );
 
     let lazy_tool_json = r#"{"name":"alpha_heavy","lazy":true,"description":"Heavy operation with long schema details for testing"}"#;
@@ -176,7 +184,7 @@ Check auth and secrets.
     // 4. config/mcp_config.json & antigravity/mcp_config.json (shared key deduplicates)
     write_file(
         &g.join("config").join("mcp_config.json"),
-        br#"{"mcpServers":{"global_srv":{"command":"bin","args":["--token","x"]},"srv_alpha":{"url":"http://localhost"}}}"#,
+        br#"{"mcpServers":{"global_srv":{"command":"bin","args":["--token","x"]},"srv_alpha":{"url":"http://localhost","tools":{"alpha_search":{"eager":true}}}}}"#,
     );
     write_file(
         &g.join("antigravity").join("mcp_config.json"),
@@ -234,7 +242,9 @@ Check auth and secrets.
     assert_eq!(inv.breakdown.mcp_tools, est_text_tokens(eager_tool_json));
     assert_eq!(
         inv.breakdown.mcp_deferred,
-        est_text_tokens(lazy_tool_json) + est_text_tokens(defer_tool_json)
+        est_text_tokens(default_lazy_tool_json)
+            + est_text_tokens(lazy_tool_json)
+            + est_text_tokens(defer_tool_json)
     );
     assert_eq!(
         inv.breakdown.rules_files,
@@ -254,6 +264,18 @@ Check auth and secrets.
     assert!(inv.breakdown.skills_deferred > inv.breakdown.skills_index);
 
     // Verify specific item fields (not just aggregates)
+    assert!(inv.items.iter().any(|i| {
+        i.kind == CustomizationKind::McpTool
+            && i.timing == LoadTiming::Always
+            && i.name == "alpha_search"
+            && i.source == "mcp:srv_alpha"
+    }));
+    assert!(inv.items.iter().any(|i| {
+        i.kind == CustomizationKind::McpTool
+            && i.timing == LoadTiming::Deferred
+            && i.name == "alpha_default_lazy"
+            && i.source == "mcp:srv_alpha"
+    }));
     assert!(inv.items.iter().any(|i| {
         i.kind == CustomizationKind::CustomAgent
             && i.timing == LoadTiming::Always
@@ -323,11 +345,34 @@ fn cust_02_secrets_never_appear_in_inventory_or_warnings() {
                         "headers": {{
                             "Authorization": "{}",
                             "X-Token": "{}"
+                        }},
+                        "tools": {{
+                            "safe_tool": {{
+                                "eager": true,
+                                "token": "{}",
+                                "headers": {{ "Authorization": "{}" }},
+                                "args": ["--secret", "{}"]
+                            }},
+                            "bad_eager_type": {{
+                                "eager": "{}",
+                                "extra": ["{}", "{}"]
+                            }}
                         }}
                     }}
                 }}
             }}"#,
-            secrets[5], secrets[2], secrets[0], secrets[4], secrets[1], secrets[3]
+            secrets[5],
+            secrets[2],
+            secrets[0],
+            secrets[4],
+            secrets[1],
+            secrets[3],
+            secrets[3],
+            secrets[1],
+            secrets[5],
+            secrets[0],
+            secrets[2],
+            secrets[4]
         )
         .as_bytes(),
     );
@@ -756,5 +801,642 @@ Explicit false rule body.
     assert_eq!(
         sum_items(&inv, CustomizationKind::RuleFile, LoadTiming::Deferred),
         r_model.estimated_tokens + r_false.estimated_tokens
+    );
+}
+
+/// CUST-09: Antigravity MCP tools default to Deferred (Lazy), and only tools configured with
+/// `tools.<name>.eager: true` in matching `mcp_config.json` / `.mcp.json` become Always without
+/// leaking across plugin prefixes.
+#[test]
+fn cust_09_mcp_default_lazy_and_plugin_prefixed_eager() {
+    let tmp = TempDir::new().unwrap();
+    let g = tmp.path();
+
+    // 1. Plugin `google-developer-knowledge` has NO `tools` eager entries -> all tools Deferred.
+    let gdk_dir = g
+        .join("antigravity")
+        .join("mcp")
+        .join("google-developer-knowledge_google-developer-knowledge");
+    let gdk_search = r#"{"name":"search_documents","description":"Search developer docs"}"#;
+    let gdk_get = r#"{"name":"get_documents","description":"Get developer docs"}"#;
+    let gdk_answer = r#"{"name":"answer_query","description":"Answer developer query"}"#;
+    write_file(
+        &gdk_dir.join("search_documents.json"),
+        gdk_search.as_bytes(),
+    );
+    write_file(&gdk_dir.join("get_documents.json"), gdk_get.as_bytes());
+    write_file(&gdk_dir.join("answer_query.json"), gdk_answer.as_bytes());
+    write_file(
+        &g.join("config")
+            .join("plugins")
+            .join("google-developer-knowledge")
+            .join("mcp_config.json"),
+        br#"{"mcpServers":{"google-developer-knowledge":{"serverUrl":"https://example.invalid/mcp"}}}"#,
+    );
+
+    // 2. Plugin `gemini-api` enables `eager: true` on 2 tools and `eager: false` on 1 tool;
+    //    an unlisted tool in the same server directory stays Deferred.
+    let gemini_dir = g
+        .join("antigravity")
+        .join("mcp")
+        .join("gemini-api_gemini-api-docs");
+    let gem_search = r#"{"name":"gemini_search_docs","description":"Search Gemini API docs"}"#;
+    let gem_get = r#"{"name":"gemini_get_doc","description":"Fetch Gemini API doc"}"#;
+    let gem_opt_out = r#"{"name":"gemini_opt_out","description":"Explicitly eager: false"}"#;
+    let gem_unlisted = r#"{"name":"gemini_unlisted","description":"Omitted from tools map"}"#;
+    write_file(
+        &gemini_dir.join("gemini_search_docs.json"),
+        gem_search.as_bytes(),
+    );
+    write_file(&gemini_dir.join("gemini_get_doc.json"), gem_get.as_bytes());
+    write_file(
+        &gemini_dir.join("gemini_opt_out.json"),
+        gem_opt_out.as_bytes(),
+    );
+    write_file(
+        &gemini_dir.join("gemini_unlisted.json"),
+        gem_unlisted.as_bytes(),
+    );
+    write_file(
+        &g.join("config")
+            .join("plugins")
+            .join("gemini-api")
+            .join("mcp_config.json"),
+        br#"{
+            "mcpServers": {
+                "gemini-api-docs": {
+                    "serverUrl": "https://example.invalid/gemini",
+                    "tools": {
+                        "gemini_search_docs": { "eager": true },
+                        "gemini_get_doc": { "eager": true },
+                        "gemini_opt_out": { "eager": false }
+                    }
+                }
+            }
+        }"#,
+    );
+
+    // 3. Same server key `gemini-api-docs` under another plugin and at root must NOT inherit
+    //    `gemini-api` plugin's eager flags.
+    let other_dir = g
+        .join("antigravity")
+        .join("mcp")
+        .join("other-plugin_gemini-api-docs");
+    let other_tool = r#"{"name":"gemini_search_docs","description":"Other plugin tool"}"#;
+    write_file(
+        &other_dir.join("gemini_search_docs.json"),
+        other_tool.as_bytes(),
+    );
+
+    let root_same_srv = g.join("antigravity").join("mcp").join("gemini-api-docs");
+    let root_same_tool = r#"{"name":"gemini_search_docs","description":"Root server tool"}"#;
+    write_file(
+        &root_same_srv.join("gemini_search_docs.json"),
+        root_same_tool.as_bytes(),
+    );
+
+    // 4. Top-level `.mcp.json` with `$schema` scalar and `tools.<name>.eager: true`
+    let top_plugin_dir = g.join("antigravity").join("mcp").join("top-plug_top_srv");
+    let top_eager = r#"{"name":"top_eager_tool","description":"Top-level .mcp.json eager tool"}"#;
+    let top_lazy = r#"{"name":"top_lazy_tool","description":"Top-level .mcp.json lazy tool"}"#;
+    write_file(
+        &top_plugin_dir.join("top_eager_tool.json"),
+        top_eager.as_bytes(),
+    );
+    write_file(
+        &top_plugin_dir.join("top_lazy_tool.json"),
+        top_lazy.as_bytes(),
+    );
+    write_file(
+        &g.join("config")
+            .join("plugins")
+            .join("top-plug")
+            .join(".mcp.json"),
+        br#"{
+            "$schema": "https://example.invalid/schema.json",
+            "top_srv": {
+                "command": "node",
+                "tools": {
+                    "top_eager_tool": { "eager": true }
+                }
+            }
+        }"#,
+    );
+
+    let inv = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    assert!(
+        inv.scan_warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        inv.scan_warnings
+    );
+
+    let find_tool = |source: &str, name: &str| {
+        inv.items
+            .iter()
+            .find(|i| i.kind == CustomizationKind::McpTool && i.source == source && i.name == name)
+            .unwrap_or_else(|| panic!("missing tool {name} in {source}"))
+    };
+
+    assert_eq!(
+        find_tool("mcp:gemini-api_gemini-api-docs", "gemini_search_docs").timing,
+        LoadTiming::Always
+    );
+    assert_eq!(
+        find_tool("mcp:gemini-api_gemini-api-docs", "gemini_get_doc").timing,
+        LoadTiming::Always
+    );
+    assert_eq!(
+        find_tool("mcp:gemini-api_gemini-api-docs", "gemini_opt_out").timing,
+        LoadTiming::Deferred
+    );
+    assert_eq!(
+        find_tool("mcp:gemini-api_gemini-api-docs", "gemini_unlisted").timing,
+        LoadTiming::Deferred
+    );
+
+    for name in ["search_documents", "get_documents", "answer_query"] {
+        assert_eq!(
+            find_tool(
+                "mcp:google-developer-knowledge_google-developer-knowledge",
+                name
+            )
+            .timing,
+            LoadTiming::Deferred
+        );
+    }
+
+    assert_eq!(
+        find_tool("mcp:other-plugin_gemini-api-docs", "gemini_search_docs").timing,
+        LoadTiming::Deferred
+    );
+    assert_eq!(
+        find_tool("mcp:gemini-api-docs", "gemini_search_docs").timing,
+        LoadTiming::Deferred
+    );
+    assert_eq!(
+        find_tool("mcp:top-plug_top_srv", "top_eager_tool").timing,
+        LoadTiming::Always
+    );
+    assert_eq!(
+        find_tool("mcp:top-plug_top_srv", "top_lazy_tool").timing,
+        LoadTiming::Deferred
+    );
+
+    let expected_always =
+        est_text_tokens(gem_search) + est_text_tokens(gem_get) + est_text_tokens(top_eager);
+    let expected_deferred = est_text_tokens(gdk_search)
+        + est_text_tokens(gdk_get)
+        + est_text_tokens(gdk_answer)
+        + est_text_tokens(gem_opt_out)
+        + est_text_tokens(gem_unlisted)
+        + est_text_tokens(other_tool)
+        + est_text_tokens(root_same_tool)
+        + est_text_tokens(top_lazy);
+
+    assert_eq!(inv.breakdown.mcp_tools, expected_always);
+    assert_eq!(inv.breakdown.mcp_deferred, expected_deferred);
+    assert_eq!(
+        sum_items(&inv, CustomizationKind::McpTool, LoadTiming::Always),
+        expected_always
+    );
+    assert_eq!(
+        sum_items(&inv, CustomizationKind::McpTool, LoadTiming::Deferred),
+        expected_deferred
+    );
+}
+
+/// CUST-10: Precedence between plugin / config / antigravity MCP configs, legacy
+/// `lazy`/`defer` compatibility, and `instructions.md` remaining Always.
+#[test]
+fn cust_10_mcp_eager_precedence_and_legacy_lazy_compat() {
+    let tmp = TempDir::new().unwrap();
+    let g = tmp.path();
+
+    let plug_srv = g.join("antigravity").join("mcp").join("my-plug_srv");
+    let instr_body = "Server instructions stay Always even if all tools are deferred.";
+    write_file(&plug_srv.join("instructions.md"), instr_body.as_bytes());
+
+    let overridden_off = r#"{"name":"overridden_off","description":"Plugin eager:true overridden to false by antigravity root"}"#;
+    let overridden_on = r#"{"name":"overridden_on","description":"Config root eager:false overridden to true by antigravity root"}"#;
+    let legacy_lazy = r#"{"name":"legacy_lazy","lazy":true,"description":"Legacy lazy stays Deferred despite eager:true"}"#;
+    let legacy_defer = r#"{"name":"legacy_defer","defer":true,"description":"Legacy defer stays Deferred despite eager:true"}"#;
+    let stem_fallback = r#"{"description":"Tool without JSON name matched by file stem"}"#;
+    let alias_off_by_stem = r#"{"name":"alias_name","description":"Plugin sets name=true, antigravity root sets stem=false"}"#;
+    let alias_on_by_name = r#"{"name":"alias2_name","description":"Plugin sets stem=false, antigravity root sets name=true"}"#;
+    let tie_same_prec =
+        r#"{"name":"tie_name","description":"Same precedence prefers JSON name over file stem"}"#;
+
+    write_file(
+        &plug_srv.join("overridden_off.json"),
+        overridden_off.as_bytes(),
+    );
+    write_file(
+        &plug_srv.join("overridden_on.json"),
+        overridden_on.as_bytes(),
+    );
+    write_file(&plug_srv.join("legacy_lazy.json"), legacy_lazy.as_bytes());
+    write_file(&plug_srv.join("legacy_defer.json"), legacy_defer.as_bytes());
+    write_file(
+        &plug_srv.join("stem_fallback.json"),
+        stem_fallback.as_bytes(),
+    );
+    write_file(
+        &plug_srv.join("alias_file.json"),
+        alias_off_by_stem.as_bytes(),
+    );
+    write_file(
+        &plug_srv.join("alias2_file.json"),
+        alias_on_by_name.as_bytes(),
+    );
+    write_file(&plug_srv.join("tie_file.json"), tie_same_prec.as_bytes());
+
+    // Precedence 0 (Plugin): sets overridden_off=true, legacy_lazy=true, legacy_defer=true,
+    // stem_fallback=true, alias_name=true, alias2_file=false, and tie_name=true vs tie_file=false.
+    write_file(
+        &g.join("config")
+            .join("plugins")
+            .join("my-plug")
+            .join("mcp_config.json"),
+        br#"{
+            "mcpServers": {
+                "srv": {
+                    "tools": {
+                        "overridden_off": { "eager": true },
+                        "legacy_lazy": { "eager": true },
+                        "legacy_defer": { "eager": true },
+                        "stem_fallback": { "eager": true },
+                        "alias_name": { "eager": true },
+                        "alias2_file": { "eager": false },
+                        "tie_name": { "eager": true },
+                        "tie_file": { "eager": false }
+                    }
+                }
+            }
+        }"#,
+    );
+
+    // Precedence 1 (config/mcp_config.json): sets overridden_on=false
+    write_file(
+        &g.join("config").join("mcp_config.json"),
+        br#"{
+            "mcpServers": {
+                "my-plug_srv": {
+                    "tools": {
+                        "overridden_on": { "eager": false }
+                    }
+                }
+            }
+        }"#,
+    );
+
+    // Precedence 2 (antigravity/mcp_config.json): overrides across name and file_stem keys
+    write_file(
+        &g.join("antigravity").join("mcp_config.json"),
+        br#"{
+            "mcpServers": {
+                "my-plug_srv": {
+                    "tools": {
+                        "overridden_off": { "eager": false },
+                        "overridden_on": { "eager": true },
+                        "alias_file": { "eager": false },
+                        "alias2_name": { "eager": true }
+                    }
+                }
+            }
+        }"#,
+    );
+
+    let inv = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    assert!(
+        inv.scan_warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        inv.scan_warnings
+    );
+
+    let find_tool = |name: &str| {
+        inv.items
+            .iter()
+            .find(|i| {
+                i.kind == CustomizationKind::McpTool
+                    && i.source == "mcp:my-plug_srv"
+                    && i.name == name
+            })
+            .unwrap_or_else(|| panic!("missing tool {name}"))
+    };
+
+    assert_eq!(find_tool("overridden_off").timing, LoadTiming::Deferred);
+    assert_eq!(find_tool("overridden_on").timing, LoadTiming::Always);
+    assert_eq!(find_tool("legacy_lazy").timing, LoadTiming::Deferred);
+    assert_eq!(find_tool("legacy_defer").timing, LoadTiming::Deferred);
+    assert_eq!(find_tool("stem_fallback").timing, LoadTiming::Always);
+    assert_eq!(find_tool("alias_name").timing, LoadTiming::Deferred);
+    assert_eq!(find_tool("alias2_name").timing, LoadTiming::Always);
+    assert_eq!(find_tool("tie_name").timing, LoadTiming::Always);
+
+    assert_eq!(inv.breakdown.mcp_instructions, est_text_tokens(instr_body));
+    assert_eq!(
+        inv.breakdown.mcp_tools,
+        est_text_tokens(overridden_on)
+            + est_text_tokens(stem_fallback)
+            + est_text_tokens(alias_on_by_name)
+            + est_text_tokens(tie_same_prec)
+    );
+    assert_eq!(
+        inv.breakdown.mcp_deferred,
+        est_text_tokens(overridden_off)
+            + est_text_tokens(legacy_lazy)
+            + est_text_tokens(legacy_defer)
+            + est_text_tokens(alias_off_by_stem)
+    );
+}
+
+/// CUST-11: Root and plugin MCP config eager flags are loaded before tool schemas
+/// so hitting MAX_SCAN_FILES does not misclassify collected eager tools as Deferred.
+#[test]
+fn cust_11_mcp_eager_classification_survives_max_scan_files() {
+    let tmp = TempDir::new().unwrap();
+    let g = tmp.path();
+
+    write_file(
+        &g.join("antigravity").join("mcp_config.json"),
+        br#"{"mcpServers":{"a_eager_srv":{"tools":{"first_tool":{"eager":true}}}}}"#,
+    );
+    write_file(
+        &g.join("config")
+            .join("plugins")
+            .join("p1")
+            .join("mcp_config.json"),
+        br#"{"mcpServers":{"plug_srv":{"tools":{"plug_tool":{"eager":true}}}}}"#,
+    );
+
+    let first_tool = r#"{"name":"first_tool","description":"Root eager tool"}"#;
+    let plug_tool = r#"{"name":"plug_tool","description":"Plugin eager tool"}"#;
+    write_file(
+        &g.join("antigravity")
+            .join("mcp")
+            .join("a_eager_srv")
+            .join("first_tool.json"),
+        first_tool.as_bytes(),
+    );
+    write_file(
+        &g.join("antigravity")
+            .join("mcp")
+            .join("p1_plug_srv")
+            .join("plug_tool.json"),
+        plug_tool.as_bytes(),
+    );
+
+    let many_dir = g.join("antigravity").join("mcp").join("z_many_srv");
+    fs::create_dir_all(&many_dir).unwrap();
+    for i in 0..(MAX_SCAN_FILES + 50) {
+        fs::write(many_dir.join(format!("t_{i:04}.json")), br#"{"name":"x"}"#).unwrap();
+    }
+
+    let inv = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    assert!(
+        inv.scan_warnings
+            .iter()
+            .any(|w| w.contains("scan file limit reached")),
+        "expected scan file limit warning, got: {:?}",
+        inv.scan_warnings
+    );
+
+    let first = inv
+        .items
+        .iter()
+        .find(|i| {
+            i.kind == CustomizationKind::McpTool
+                && i.source == "mcp:a_eager_srv"
+                && i.name == "first_tool"
+        })
+        .expect("first_tool should be scanned before limit");
+    assert_eq!(first.timing, LoadTiming::Always);
+
+    let plug = inv
+        .items
+        .iter()
+        .find(|i| {
+            i.kind == CustomizationKind::McpTool
+                && i.source == "mcp:p1_plug_srv"
+                && i.name == "plug_tool"
+        })
+        .expect("plug_tool should be scanned before limit");
+    assert_eq!(plug.timing, LoadTiming::Always);
+}
+
+/// CUST-12: Missing optional MCP config files do not consume MAX_SCAN_FILES budget,
+/// allowing exact-limit real files (tools + builtin skill) without silent omission, while
+/// exceeding the limit on an existing directory triggers the scan-limit warning.
+#[test]
+fn cust_12_missing_optional_mcp_configs_do_not_consume_file_limit() {
+    // 1. Exactly MAX_SCAN_FILES real files (1999 MCP tools + 1 builtin skill) with no mcp_config.json / config/
+    let tmp_exact = TempDir::new().unwrap();
+    let g_exact = tmp_exact.path();
+    let srv_dir = g_exact.join("antigravity").join("mcp").join("srv");
+    fs::create_dir_all(&srv_dir).unwrap();
+    for i in 0..(MAX_SCAN_FILES - 1) {
+        fs::write(srv_dir.join(format!("t_{i:04}.json")), br#"{"name":"x"}"#).unwrap();
+    }
+    write_file(
+        &g_exact
+            .join("antigravity")
+            .join("builtin")
+            .join("skills")
+            .join("exact_skill")
+            .join("SKILL.md"),
+        b"---\nname: exact_skill\ndescription: Exact limit skill\n---\nBody.\n",
+    );
+
+    let inv_exact = scan_customizations(&GeminiPaths::from_gemini_dir(g_exact));
+    assert!(
+        inv_exact.scan_warnings.is_empty(),
+        "unexpected warnings at exact MAX_SCAN_FILES: {:?}",
+        inv_exact.scan_warnings
+    );
+    assert!(
+        inv_exact.items.iter().any(|i| {
+            i.kind == CustomizationKind::SkillIndex
+                && i.timing == LoadTiming::Always
+                && i.name == "exact_skill"
+                && i.source == "builtin"
+        }),
+        "builtin skill should not be dropped when optional mcp_config.json is absent"
+    );
+    assert_eq!(
+        inv_exact
+            .items
+            .iter()
+            .filter(|i| i.kind == CustomizationKind::McpTool)
+            .count(),
+        MAX_SCAN_FILES - 1
+    );
+
+    // 2. MAX_SCAN_FILES tools (2000) + existing builtin/skills/exact_skill -> enter_dir hits limit with warning
+    let tmp_over = TempDir::new().unwrap();
+    let g_over = tmp_over.path();
+    let srv_over = g_over.join("antigravity").join("mcp").join("srv");
+    fs::create_dir_all(&srv_over).unwrap();
+    for i in 0..MAX_SCAN_FILES {
+        fs::write(srv_over.join(format!("t_{i:04}.json")), br#"{"name":"x"}"#).unwrap();
+    }
+    write_file(
+        &g_over
+            .join("antigravity")
+            .join("builtin")
+            .join("skills")
+            .join("exact_skill")
+            .join("SKILL.md"),
+        b"---\nname: exact_skill\ndescription: Over limit skill\n---\nBody.\n",
+    );
+
+    let inv_over = scan_customizations(&GeminiPaths::from_gemini_dir(g_over));
+    assert!(
+        inv_over
+            .scan_warnings
+            .iter()
+            .any(|w| w.contains("scan file limit reached")),
+        "expected scan file limit warning when builtin dir is skipped, got: {:?}",
+        inv_over.scan_warnings
+    );
+    assert!(
+        !inv_over
+            .items
+            .iter()
+            .any(|i| i.kind == CustomizationKind::SkillIndex && i.name == "exact_skill"),
+        "skill beyond MAX_SCAN_FILES should be skipped"
+    );
+}
+
+/// CUST-13: Hitting MAX_STAT_PROBES (8,000) keeps the 8,000th successful probe entry,
+/// skips the 8,001st probe, and emits the distinct stat-probe limit warning instead of
+/// misreporting MAX_SCAN_FILES (2,000).
+#[test]
+fn cust_13_stat_probe_exact_boundary_keeps_8000th_and_warns_distinctly() {
+    let tmp = TempDir::new().unwrap();
+    let g = tmp.path();
+
+    // Pre-probes before tools:
+    // enter_dir(antigravity)=1, enter_dir(config)=1, read(antigravity/mcp_config.json)=1,
+    // read(config/mcp_config.json)=1, enter_dir(config/plugins)=1,
+    // 1500 empty plugins * (3 config probes + 1 enter_dir(mcp)) = 6000,
+    // enter_dir(antigravity/mcp)=1 -> total 6006 probes.
+    let plugins_dir = g.join("config").join("plugins");
+    fs::create_dir_all(&plugins_dir).unwrap();
+    for i in 0..1500 {
+        fs::create_dir_all(plugins_dir.join(format!("p_{i:04}"))).unwrap();
+    }
+
+    let srv_dir = g.join("antigravity").join("mcp").join("srv");
+    fs::create_dir_all(&srv_dir).unwrap();
+    let pre_probes = 1 + 1 + 1 + 1 + 1 + (1500 * 4) + 1;
+    let keep_count = MAX_STAT_PROBES - pre_probes; // 8000 - 6006 = 1994 (< MAX_SCAN_FILES)
+    assert!(keep_count < MAX_SCAN_FILES);
+
+    for i in 0..keep_count {
+        let body = if i == keep_count - 1 {
+            r#"{"name":"probe_8000_tool","description":"8000th probe should be kept"}"#
+        } else {
+            r#"{"name":"x"}"#
+        };
+        fs::write(srv_dir.join(format!("t_{i:04}.json")), body).unwrap();
+    }
+    fs::write(
+        srv_dir.join(format!("t_{keep_count:04}.json")),
+        br#"{"name":"probe_8001_tool","description":"8001st probe should be skipped"}"#,
+    )
+    .unwrap();
+
+    let inv = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    let mcp_tools: Vec<_> = inv
+        .items
+        .iter()
+        .filter(|i| i.kind == CustomizationKind::McpTool)
+        .collect();
+    assert_eq!(mcp_tools.len(), keep_count);
+    assert!(
+        mcp_tools.iter().any(|i| i.name == "probe_8000_tool"),
+        "8000th stat probe tool must be preserved"
+    );
+    assert!(
+        !mcp_tools.iter().any(|i| i.name == "probe_8001_tool"),
+        "8001st stat probe tool must be skipped"
+    );
+    assert!(
+        inv.scan_warnings.iter().any(|w| w.contains(&format!(
+            "scan stat probe limit reached ({MAX_STAT_PROBES})"
+        ))),
+        "expected stat probe limit warning, got: {:?}",
+        inv.scan_warnings
+    );
+    assert!(
+        !inv.scan_warnings
+            .iter()
+            .any(|w| w.contains("scan file limit reached")),
+        "must not emit file limit warning when stat probe limit hit first: {:?}",
+        inv.scan_warnings
+    );
+}
+
+/// CUST-14: When both MAX_SCAN_FILES (2,000) and MAX_STAT_PROBES (8,000) are reached
+/// simultaneously, only a single scan-limit warning is emitted (preferring file limit).
+#[test]
+fn cust_14_simultaneous_file_and_stat_limits_emit_single_warning() {
+    let tmp = TempDir::new().unwrap();
+    let g = tmp.path();
+
+    let plugins_dir = g.join("config").join("plugins");
+    fs::create_dir_all(&plugins_dir).unwrap();
+    for i in 0..1499 {
+        fs::create_dir_all(plugins_dir.join(format!("p_{i:04}"))).unwrap();
+    }
+    write_file(
+        &plugins_dir.join("p_0000").join("mcp_config.json"),
+        br#"{"mcpServers":{}}"#,
+    );
+    write_file(
+        &plugins_dir.join("p_0001").join("mcp_config.json"),
+        br#"{"mcpServers":{}}"#,
+    );
+    write_file(
+        &plugins_dir.join("p_0000").join("rules").join("extra.md"),
+        b"# Extra Rule\n",
+    );
+
+    let srv_dir = g.join("antigravity").join("mcp").join("srv");
+    fs::create_dir_all(&srv_dir).unwrap();
+    for i in 0..1998 {
+        fs::write(srv_dir.join(format!("t_{i:04}.json")), br#"{"name":"x"}"#).unwrap();
+    }
+    write_file(
+        &g.join("antigravity")
+            .join("builtin")
+            .join("skills")
+            .join("extra")
+            .join("SKILL.md"),
+        b"---\nname: extra\ndescription: Extra skill\n---\nBody.\n",
+    );
+
+    let inv = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    let mcp_tool_count = inv
+        .items
+        .iter()
+        .filter(|i| i.kind == CustomizationKind::McpTool)
+        .count();
+    assert_eq!(mcp_tool_count, 1998);
+    assert_eq!(
+        inv.scan_warnings.len(),
+        1,
+        "expected exactly one limit warning, got: {:?}",
+        inv.scan_warnings
+    );
+    assert!(
+        inv.scan_warnings[0].contains(&format!("scan file limit reached ({MAX_SCAN_FILES})")),
+        "expected file limit warning when both limits hit, got: {:?}",
+        inv.scan_warnings
+    );
+    assert!(
+        !inv.scan_warnings[0].contains("scan stat probe limit reached"),
+        "must not emit stat probe limit warning alongside file limit: {:?}",
+        inv.scan_warnings
     );
 }

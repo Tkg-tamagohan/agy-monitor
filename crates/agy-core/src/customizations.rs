@@ -4,12 +4,16 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use std::fmt;
+
 use serde::Deserialize;
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use crate::analyzer::{CustomizationBreakdown, est_text_tokens};
 use crate::paths::GeminiPaths;
 
 pub const MAX_SCAN_FILES: usize = 2000;
+pub const MAX_STAT_PROBES: usize = MAX_SCAN_FILES * 4;
 pub const MAX_FILE_BYTES: u64 = 512 * 1024;
 pub const MAX_SCAN_DEPTH: usize = 8;
 pub const MAX_WARNINGS: usize = 50;
@@ -62,9 +66,98 @@ pub fn scan_customizations_cancellable(
         return None;
     }
 
-    // 1. antigravity/mcp/<server>/ and antigravity/builtin/skills/*/SKILL.md
+    // 1. Root MCP configs (antigravity/mcp_config.json and config/mcp_config.json)
+    // Read before large directories so MAX_SCAN_FILES does not skip eager flags.
     let antigravity_dir = paths.gemini_dir.join("antigravity");
-    if ctx.enter_dir(&antigravity_dir) {
+    let has_antigravity = ctx.enter_dir(&antigravity_dir);
+    let config_dir = paths.gemini_dir.join("config");
+    let has_config = ctx.enter_dir(&config_dir);
+
+    if has_antigravity {
+        let antigravity_mcp_cfg = antigravity_dir.join("mcp_config.json");
+        if !scan_mcp_config_file(
+            &mut ctx,
+            &antigravity_mcp_cfg,
+            false,
+            None,
+            PRECEDENCE_ANTIGRAVITY_ROOT,
+        ) {
+            return None;
+        }
+    }
+
+    if ctx.is_cancelled() {
+        return None;
+    }
+
+    if has_config {
+        let config_mcp_cfg = config_dir.join("mcp_config.json");
+        if !scan_mcp_config_file(
+            &mut ctx,
+            &config_mcp_cfg,
+            false,
+            None,
+            PRECEDENCE_CONFIG_ROOT,
+        ) {
+            return None;
+        }
+    }
+
+    if ctx.is_cancelled() {
+        return None;
+    }
+
+    // 2. config/plugins/<plugin>/ MCP configs first
+    let plugins_dir = config_dir.join("plugins");
+    let plugin_entries = if has_config && ctx.enter_dir(&plugins_dir) {
+        Some(ctx.read_dir_sorted(&plugins_dir)?)
+    } else {
+        None
+    };
+
+    if let Some(entries) = &plugin_entries {
+        for (plugin_name, plugin_path, ft) in entries {
+            if ctx.is_cancelled() {
+                return None;
+            }
+            if ctx.hit_any_limit() {
+                break;
+            }
+            if !ft.is_dir() {
+                continue;
+            }
+            ctx.plugins.insert(plugin_name.clone());
+            let plugin_depth = 3;
+
+            for mcp_file in [".mcp.json", "mcp_config.json", "mcp.json"] {
+                let path = plugin_path.join(mcp_file);
+                let allow_top_level = mcp_file == ".mcp.json";
+                if !scan_mcp_config_file(
+                    &mut ctx,
+                    &path,
+                    allow_top_level,
+                    Some(plugin_name),
+                    PRECEDENCE_PLUGIN,
+                ) {
+                    return None;
+                }
+            }
+
+            let plugin_mcp_dir = plugin_path.join("mcp");
+            if ctx.enter_dir(&plugin_mcp_dir)
+                && !scan_plugin_mcp_dir(&mut ctx, plugin_name, &plugin_mcp_dir, plugin_depth + 1)
+            {
+                return None;
+            }
+        }
+    }
+
+    if ctx.is_cancelled() {
+        return None;
+    }
+
+    // 3. antigravity/mcp/<server>/ and antigravity/builtin/skills/*/SKILL.md
+    if has_antigravity {
         let mcp_dir = antigravity_dir.join("mcp");
         if ctx.enter_dir(&mcp_dir) && !scan_antigravity_mcp(&mut ctx, &mcp_dir, 2) {
             return None;
@@ -77,28 +170,49 @@ pub fn scan_customizations_cancellable(
         {
             return None;
         }
-
-        let antigravity_mcp_cfg = antigravity_dir.join("mcp_config.json");
-        if !scan_mcp_config_file(&mut ctx, &antigravity_mcp_cfg, false) {
-            return None;
-        }
     }
 
     if ctx.is_cancelled() {
         return None;
     }
 
-    // 2. config/plugins/<plugin>/ and config/mcp_config.json
-    let config_dir = paths.gemini_dir.join("config");
-    if ctx.enter_dir(&config_dir) {
-        let plugins_dir = config_dir.join("plugins");
-        if ctx.enter_dir(&plugins_dir) && !scan_plugins_dir(&mut ctx, &plugins_dir, 2) {
-            return None;
-        }
+    // 4. config/plugins/<plugin>/ rules, skills, agents, and subagents
+    if let Some(entries) = &plugin_entries {
+        for (plugin_name, plugin_path, ft) in entries {
+            if ctx.is_cancelled() {
+                return None;
+            }
+            if ctx.hit_any_limit() {
+                break;
+            }
+            if !ft.is_dir() {
+                continue;
+            }
+            let source = format!("plugin:{plugin_name}");
+            let plugin_depth = 3;
 
-        let config_mcp_cfg = config_dir.join("mcp_config.json");
-        if !scan_mcp_config_file(&mut ctx, &config_mcp_cfg, false) {
-            return None;
+            let rules_dir = plugin_path.join("rules");
+            if ctx.enter_dir(&rules_dir)
+                && !scan_plugin_rules_dir(&mut ctx, &rules_dir, &source, plugin_depth + 1)
+            {
+                return None;
+            }
+
+            let skills_dir = plugin_path.join("skills");
+            if ctx.enter_dir(&skills_dir)
+                && !scan_skills_dir(&mut ctx, &skills_dir, &source, plugin_depth + 1)
+            {
+                return None;
+            }
+
+            for agents_sub in ["agents", "subagents"] {
+                let agents_dir = plugin_path.join(agents_sub);
+                if ctx.enter_dir(&agents_dir)
+                    && !scan_plugin_agents_dir(&mut ctx, &agents_dir, &source, plugin_depth + 1)
+                {
+                    return None;
+                }
+            }
         }
     }
 
@@ -109,16 +223,22 @@ pub fn scan_customizations_cancellable(
     Some(ctx.finish())
 }
 
+const PRECEDENCE_PLUGIN: u8 = 0;
+const PRECEDENCE_CONFIG_ROOT: u8 = 1;
+const PRECEDENCE_ANTIGRAVITY_ROOT: u8 = 2;
+
 struct ScanContext<'a> {
     gemini_dir: &'a Path,
     cancel: &'a AtomicBool,
     items: Vec<CustomizationItem>,
+    mcp_tool_eager: HashMap<(String, String), (u8, bool)>,
     breakdown: CustomizationBreakdown,
     mcp_servers: HashSet<String>,
     plugins: HashSet<String>,
     warnings: Vec<String>,
     files_scanned: usize,
-    file_limit_warned: bool,
+    stat_probes: usize,
+    scan_limit_warned: bool,
 }
 
 impl<'a> ScanContext<'a> {
@@ -127,12 +247,67 @@ impl<'a> ScanContext<'a> {
             gemini_dir,
             cancel,
             items: Vec::new(),
+            mcp_tool_eager: HashMap::new(),
             breakdown: CustomizationBreakdown::default(),
             mcp_servers: HashSet::new(),
             plugins: HashSet::new(),
             warnings: Vec::new(),
             files_scanned: 0,
-            file_limit_warned: false,
+            stat_probes: 0,
+            scan_limit_warned: false,
+        }
+    }
+
+    fn record_mcp_tool_eager(
+        &mut self,
+        server_key: String,
+        tool_name: String,
+        eager: bool,
+        precedence: u8,
+    ) {
+        let key = (server_key, tool_name);
+        match self.mcp_tool_eager.get_mut(&key) {
+            Some((existing_prec, existing_eager)) => {
+                if precedence >= *existing_prec {
+                    *existing_prec = precedence;
+                    *existing_eager = eager;
+                }
+            }
+            None => {
+                self.mcp_tool_eager.insert(key, (precedence, eager));
+            }
+        }
+    }
+
+    fn lookup_mcp_tool_eager(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        file_stem: &str,
+    ) -> Option<bool> {
+        let name_entry = self
+            .mcp_tool_eager
+            .get(&(server_name.to_string(), tool_name.to_string()))
+            .copied();
+        let stem_entry = if file_stem != tool_name {
+            self.mcp_tool_eager
+                .get(&(server_name.to_string(), file_stem.to_string()))
+                .copied()
+        } else {
+            None
+        };
+
+        match (name_entry, stem_entry) {
+            (Some((np, ne)), Some((sp, se))) => {
+                if sp > np {
+                    Some(se)
+                } else {
+                    Some(ne)
+                }
+            }
+            (Some((_, ne)), None) => Some(ne),
+            (None, Some((_, se))) => Some(se),
+            (None, None) => None,
         }
     }
 
@@ -140,8 +315,65 @@ impl<'a> ScanContext<'a> {
         self.cancel.load(Ordering::Relaxed)
     }
 
-    fn limit_reached(&self) -> bool {
+    fn file_limit_reached(&self) -> bool {
         self.files_scanned >= MAX_SCAN_FILES
+    }
+
+    fn stat_limit_reached(&self) -> bool {
+        self.stat_probes >= MAX_STAT_PROBES
+    }
+
+    fn warn_file_limit_once(&mut self) {
+        if !self.scan_limit_warned {
+            self.scan_limit_warned = true;
+            self.push_warning(format!(
+                "scan file limit reached ({MAX_SCAN_FILES}); remaining files skipped"
+            ));
+        }
+    }
+
+    fn warn_stat_limit_once(&mut self) {
+        if !self.scan_limit_warned {
+            self.scan_limit_warned = true;
+            self.push_warning(format!(
+                "scan stat probe limit reached ({MAX_STAT_PROBES}); remaining entries skipped"
+            ));
+        }
+    }
+
+    fn try_reserve_stat_probe(&mut self) -> bool {
+        if self.stat_limit_reached() {
+            if self.file_limit_reached() {
+                self.warn_file_limit_once();
+            } else {
+                self.warn_stat_limit_once();
+            }
+            false
+        } else {
+            self.stat_probes += 1;
+            true
+        }
+    }
+
+    fn hit_file_limit(&mut self) -> bool {
+        if self.file_limit_reached() {
+            self.warn_file_limit_once();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn hit_any_limit(&mut self) -> bool {
+        if self.file_limit_reached() {
+            self.warn_file_limit_once();
+            true
+        } else if self.stat_limit_reached() {
+            self.warn_stat_limit_once();
+            true
+        } else {
+            false
+        }
     }
 
     fn rel_display(&self, path: &Path) -> String {
@@ -191,25 +423,32 @@ impl<'a> ScanContext<'a> {
     }
 
     fn enter_dir(&mut self, path: &Path) -> bool {
-        if self.is_cancelled() || self.limit_reached() {
+        if self.is_cancelled() || !self.try_reserve_stat_probe() {
             return false;
         }
         match std::fs::symlink_metadata(path) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
-                    let rel = self.rel_display(path);
-                    self.push_warning(format!("{rel}: skipped symlink directory"));
+                    if !self.file_limit_reached() {
+                        let rel = self.rel_display(path);
+                        self.push_warning(format!("{rel}: skipped symlink directory"));
+                    }
                     return false;
                 }
-                meta.file_type().is_dir()
+                if !meta.file_type().is_dir() {
+                    return false;
+                }
+                !self.hit_file_limit()
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
             Err(err) => {
-                let rel = self.rel_display(path);
-                self.push_warning(format!(
-                    "{rel}: failed to stat directory ({:?})",
-                    err.kind()
-                ));
+                if !self.file_limit_reached() {
+                    let rel = self.rel_display(path);
+                    self.push_warning(format!(
+                        "{rel}: failed to stat directory ({:?})",
+                        err.kind()
+                    ));
+                }
                 false
             }
         }
@@ -269,26 +508,28 @@ impl<'a> ScanContext<'a> {
         if self.is_cancelled() {
             return ReadOutcome::Cancelled;
         }
-        if self.files_scanned >= MAX_SCAN_FILES {
-            if !self.file_limit_warned {
-                self.file_limit_warned = true;
-                self.push_warning(format!(
-                    "scan file limit reached ({MAX_SCAN_FILES}); remaining files skipped"
-                ));
-            }
+        if !self.try_reserve_stat_probe() {
             return ReadOutcome::LimitReached;
         }
-        self.files_scanned += 1;
 
         let meta = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return ReadOutcome::Missing,
             Err(err) => {
+                if self.hit_file_limit() {
+                    return ReadOutcome::LimitReached;
+                }
+                self.files_scanned += 1;
                 let rel = self.rel_display(path);
                 self.push_warning(format!("{rel}: failed to stat file ({:?})", err.kind()));
                 return ReadOutcome::Skipped;
             }
         };
+
+        if self.hit_file_limit() {
+            return ReadOutcome::LimitReached;
+        }
+        self.files_scanned += 1;
 
         if meta.file_type().is_symlink() {
             let rel = self.rel_display(path);
@@ -380,9 +621,234 @@ struct McpToolMetadata {
 #[derive(Deserialize)]
 struct McpConfigKeysOnly {
     #[serde(default, rename = "mcpServers")]
-    mcp_servers: Option<HashMap<String, serde::de::IgnoredAny>>,
+    mcp_servers: Option<HashMap<String, McpServerConfigSafe>>,
     #[serde(flatten)]
-    top_level: HashMap<String, serde::de::IgnoredAny>,
+    top_level: HashMap<String, McpServerConfigSafe>,
+}
+
+fn drain_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
+    while seq.next_element::<IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+fn drain_map<'de, A: MapAccess<'de>>(mut map: A) -> Result<(), A::Error> {
+    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+#[derive(Default)]
+struct McpServerConfigSafe {
+    tool_eager: HashMap<String, bool>,
+}
+
+impl<'de> Deserialize<'de> for McpServerConfigSafe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ServerVisitor;
+        impl<'de> Visitor<'de> for ServerVisitor {
+            type Value = McpServerConfigSafe;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("MCP server configuration object")
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                drain_seq(seq)?;
+                Ok(Self::Value::default())
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut tool_eager = HashMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "tools" {
+                        tool_eager = map.next_value::<McpToolsMapSafe>()?.0;
+                    } else {
+                        let _ = map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(McpServerConfigSafe { tool_eager })
+            }
+        }
+        deserializer.deserialize_any(ServerVisitor)
+    }
+}
+
+#[derive(Default)]
+struct McpToolsMapSafe(HashMap<String, bool>);
+
+impl<'de> Deserialize<'de> for McpToolsMapSafe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ToolsMapVisitor;
+        impl<'de> Visitor<'de> for ToolsMapVisitor {
+            type Value = McpToolsMapSafe;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("MCP tools map")
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                drain_seq(seq)?;
+                Ok(Self::Value::default())
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut out = HashMap::new();
+                while let Some(raw_name) = map.next_key::<String>()? {
+                    let entry = map.next_value::<McpToolEntrySafe>()?;
+                    if let Some(eager) = entry.eager {
+                        let trimmed = raw_name.trim();
+                        if !trimmed.is_empty() {
+                            out.insert(trimmed.to_string(), eager);
+                        }
+                    }
+                }
+                Ok(McpToolsMapSafe(out))
+            }
+        }
+        deserializer.deserialize_any(ToolsMapVisitor)
+    }
+}
+
+#[derive(Default)]
+struct McpToolEntrySafe {
+    eager: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for McpToolEntrySafe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EntryVisitor;
+        impl<'de> Visitor<'de> for EntryVisitor {
+            type Value = McpToolEntrySafe;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("MCP tool entry object")
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                drain_seq(seq)?;
+                Ok(Self::Value::default())
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut eager = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "eager" {
+                        eager = map.next_value::<OptionalBoolSafe>()?.0;
+                    } else {
+                        let _ = map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(McpToolEntrySafe { eager })
+            }
+        }
+        deserializer.deserialize_any(EntryVisitor)
+    }
+}
+
+#[derive(Default)]
+struct OptionalBoolSafe(Option<bool>);
+
+impl<'de> Deserialize<'de> for OptionalBoolSafe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BoolVisitor;
+        impl<'de> Visitor<'de> for BoolVisitor {
+            type Value = OptionalBoolSafe;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("optional boolean")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(Some(v)))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                drain_seq(seq)?;
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                drain_map(map)?;
+                Ok(OptionalBoolSafe(None))
+            }
+        }
+        deserializer.deserialize_any(BoolVisitor)
+    }
 }
 
 fn classify_json_error(err: &serde_json::Error) -> &'static str {
@@ -402,7 +868,7 @@ fn scan_antigravity_mcp(ctx: &mut ScanContext<'_>, mcp_dir: &Path, depth: usize)
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.limit_reached() {
+        if ctx.hit_any_limit() {
             break;
         }
         if !ft.is_dir() {
@@ -437,7 +903,7 @@ fn scan_mcp_server_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.limit_reached() {
+        if ctx.hit_any_limit() {
             break;
         }
         if ft.is_dir() {
@@ -484,16 +950,20 @@ fn scan_mcp_server_dir(
                     continue;
                 }
             };
-            let timing = if meta.lazy == Some(true) || meta.defer == Some(true) {
-                LoadTiming::Deferred
-            } else {
-                LoadTiming::Always
-            };
+            let explicit_deferred = meta.lazy == Some(true) || meta.defer == Some(true);
+            let file_stem = file_stem_or_name(&path);
             let name = meta
                 .name
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| file_stem_or_name(&path));
+                .unwrap_or_else(|| file_stem.clone());
+            let timing = if explicit_deferred {
+                LoadTiming::Deferred
+            } else if ctx.lookup_mcp_tool_eager(server_name, &name, &file_stem) == Some(true) {
+                LoadTiming::Always
+            } else {
+                LoadTiming::Deferred
+            };
             let estimated_tokens = est_text_tokens(&text);
             ctx.push_item(CustomizationItem {
                 kind: CustomizationKind::McpTool,
@@ -528,7 +998,7 @@ fn scan_skills_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.limit_reached() {
+        if ctx.hit_any_limit() {
             break;
         }
         if !ft.is_dir() {
@@ -598,65 +1068,6 @@ fn scan_skills_dir(
     true
 }
 
-fn scan_plugins_dir(ctx: &mut ScanContext<'_>, plugins_dir: &Path, depth: usize) -> bool {
-    let Some(entries) = ctx.read_dir_sorted(plugins_dir) else {
-        return false;
-    };
-    for (plugin_name, plugin_path, ft) in entries {
-        if ctx.is_cancelled() {
-            return false;
-        }
-        if ctx.limit_reached() {
-            break;
-        }
-        if !ft.is_dir() {
-            continue;
-        }
-        ctx.plugins.insert(plugin_name.clone());
-        let source = format!("plugin:{plugin_name}");
-        let plugin_depth = depth + 1;
-
-        let rules_dir = plugin_path.join("rules");
-        if ctx.enter_dir(&rules_dir)
-            && !scan_plugin_rules_dir(ctx, &rules_dir, &source, plugin_depth + 1)
-        {
-            return false;
-        }
-
-        let skills_dir = plugin_path.join("skills");
-        if ctx.enter_dir(&skills_dir)
-            && !scan_skills_dir(ctx, &skills_dir, &source, plugin_depth + 1)
-        {
-            return false;
-        }
-
-        for agents_sub in ["agents", "subagents"] {
-            let agents_dir = plugin_path.join(agents_sub);
-            if ctx.enter_dir(&agents_dir)
-                && !scan_plugin_agents_dir(ctx, &agents_dir, &source, plugin_depth + 1)
-            {
-                return false;
-            }
-        }
-
-        for mcp_file in [".mcp.json", "mcp_config.json", "mcp.json"] {
-            let path = plugin_path.join(mcp_file);
-            let allow_top_level = mcp_file == ".mcp.json";
-            if !scan_mcp_config_file(ctx, &path, allow_top_level) {
-                return false;
-            }
-        }
-
-        let plugin_mcp_dir = plugin_path.join("mcp");
-        if ctx.enter_dir(&plugin_mcp_dir)
-            && !scan_plugin_mcp_dir(ctx, &plugin_mcp_dir, plugin_depth + 1)
-        {
-            return false;
-        }
-    }
-    true
-}
-
 fn scan_plugin_rules_dir(
     ctx: &mut ScanContext<'_>,
     dir: &Path,
@@ -677,7 +1088,7 @@ fn scan_plugin_rules_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.limit_reached() {
+        if ctx.hit_any_limit() {
             break;
         }
         if ft.is_dir() {
@@ -734,7 +1145,7 @@ fn scan_plugin_agents_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.limit_reached() {
+        if ctx.hit_any_limit() {
             break;
         }
         if ft.is_dir() {
@@ -774,7 +1185,12 @@ fn scan_plugin_agents_dir(
     true
 }
 
-fn scan_plugin_mcp_dir(ctx: &mut ScanContext<'_>, mcp_dir: &Path, depth: usize) -> bool {
+fn scan_plugin_mcp_dir(
+    ctx: &mut ScanContext<'_>,
+    plugin_name: &str,
+    mcp_dir: &Path,
+    depth: usize,
+) -> bool {
     if depth > MAX_SCAN_DEPTH {
         let rel = ctx.rel_display(mcp_dir);
         ctx.push_warning(format!(
@@ -793,18 +1209,24 @@ fn scan_plugin_mcp_dir(ctx: &mut ScanContext<'_>, mcp_dir: &Path, depth: usize) 
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.limit_reached() {
+        if ctx.hit_any_limit() {
             break;
         }
         if ft.is_file() {
             if name == ".mcp.json" || name == "mcp_config.json" || name == "mcp.json" {
                 let allow_top_level = name == ".mcp.json";
-                if !scan_mcp_config_file(ctx, &path, allow_top_level) {
+                if !scan_mcp_config_file(
+                    ctx,
+                    &path,
+                    allow_top_level,
+                    Some(plugin_name),
+                    PRECEDENCE_PLUGIN,
+                ) {
                     return false;
                 }
             } else if !is_node_bundle
                 && has_ascii_extension(&path, "json")
-                && !scan_mcp_config_file(ctx, &path, false)
+                && !scan_mcp_config_file(ctx, &path, false, Some(plugin_name), PRECEDENCE_PLUGIN)
             {
                 return false;
             }
@@ -822,7 +1244,13 @@ fn is_ignored_code_subdir(name: &str) -> bool {
     )
 }
 
-fn scan_mcp_config_file(ctx: &mut ScanContext<'_>, path: &Path, allow_top_level: bool) -> bool {
+fn scan_mcp_config_file(
+    ctx: &mut ScanContext<'_>,
+    path: &Path,
+    allow_top_level: bool,
+    plugin_prefix: Option<&str>,
+    precedence: u8,
+) -> bool {
     let text = match ctx.read_safe_utf8_file(path) {
         ReadOutcome::Ok(t) => t,
         ReadOutcome::Cancelled => return false,
@@ -841,20 +1269,35 @@ fn scan_mcp_config_file(ctx: &mut ScanContext<'_>, path: &Path, allow_top_level:
         }
     };
 
+    let mut register_servers = |servers: HashMap<String, McpServerConfigSafe>,
+                                skip_dollar: bool| {
+        for (key, server_cfg) in servers {
+            let trimmed = key.trim();
+            if trimmed.is_empty() || (skip_dollar && trimmed.starts_with('$')) {
+                continue;
+            }
+            ctx.mcp_servers.insert(trimmed.to_string());
+            if !server_cfg.tool_eager.is_empty() {
+                let server_lookup_key = match plugin_prefix {
+                    Some(prefix) => format!("{prefix}_{trimmed}"),
+                    None => trimmed.to_string(),
+                };
+                for (tool_name, eager) in server_cfg.tool_eager {
+                    ctx.record_mcp_tool_eager(
+                        server_lookup_key.clone(),
+                        tool_name,
+                        eager,
+                        precedence,
+                    );
+                }
+            }
+        }
+    };
+
     if let Some(servers) = parsed.mcp_servers {
-        for key in servers.into_keys() {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                ctx.mcp_servers.insert(trimmed.to_string());
-            }
-        }
+        register_servers(servers, false);
     } else if allow_top_level {
-        for key in parsed.top_level.into_keys() {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with('$') {
-                ctx.mcp_servers.insert(trimmed.to_string());
-            }
-        }
+        register_servers(parsed.top_level, true);
     }
 
     true
