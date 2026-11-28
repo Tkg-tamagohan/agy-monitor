@@ -44,6 +44,13 @@ fn cust_01_full_mock_tree_and_breakdown_sums() {
         eager_tool_json.as_bytes(),
     );
 
+    let default_lazy_tool_json =
+        r#"{"name":"alpha_default_lazy","description":"Default lazy tool without eager flag"}"#;
+    write_file(
+        &mcp_srv1.join("alpha_default_lazy.json"),
+        default_lazy_tool_json.as_bytes(),
+    );
+
     let lazy_tool_json = r#"{"name":"alpha_heavy","lazy":true,"description":"Heavy operation with long schema details for testing"}"#;
     write_file(
         &mcp_srv1.join("alpha_heavy.json"),
@@ -176,7 +183,7 @@ Check auth and secrets.
     // 4. config/mcp_config.json & antigravity/mcp_config.json (shared key deduplicates)
     write_file(
         &g.join("config").join("mcp_config.json"),
-        br#"{"mcpServers":{"global_srv":{"command":"bin","args":["--token","x"]},"srv_alpha":{"url":"http://localhost"}}}"#,
+        br#"{"mcpServers":{"global_srv":{"command":"bin","args":["--token","x"]},"srv_alpha":{"url":"http://localhost","tools":{"alpha_search":{"eager":true}}}}}"#,
     );
     write_file(
         &g.join("antigravity").join("mcp_config.json"),
@@ -234,7 +241,9 @@ Check auth and secrets.
     assert_eq!(inv.breakdown.mcp_tools, est_text_tokens(eager_tool_json));
     assert_eq!(
         inv.breakdown.mcp_deferred,
-        est_text_tokens(lazy_tool_json) + est_text_tokens(defer_tool_json)
+        est_text_tokens(default_lazy_tool_json)
+            + est_text_tokens(lazy_tool_json)
+            + est_text_tokens(defer_tool_json)
     );
     assert_eq!(
         inv.breakdown.rules_files,
@@ -254,6 +263,18 @@ Check auth and secrets.
     assert!(inv.breakdown.skills_deferred > inv.breakdown.skills_index);
 
     // Verify specific item fields (not just aggregates)
+    assert!(inv.items.iter().any(|i| {
+        i.kind == CustomizationKind::McpTool
+            && i.timing == LoadTiming::Always
+            && i.name == "alpha_search"
+            && i.source == "mcp:srv_alpha"
+    }));
+    assert!(inv.items.iter().any(|i| {
+        i.kind == CustomizationKind::McpTool
+            && i.timing == LoadTiming::Deferred
+            && i.name == "alpha_default_lazy"
+            && i.source == "mcp:srv_alpha"
+    }));
     assert!(inv.items.iter().any(|i| {
         i.kind == CustomizationKind::CustomAgent
             && i.timing == LoadTiming::Always
@@ -323,11 +344,34 @@ fn cust_02_secrets_never_appear_in_inventory_or_warnings() {
                         "headers": {{
                             "Authorization": "{}",
                             "X-Token": "{}"
+                        }},
+                        "tools": {{
+                            "safe_tool": {{
+                                "eager": true,
+                                "token": "{}",
+                                "headers": {{ "Authorization": "{}" }},
+                                "args": ["--secret", "{}"]
+                            }},
+                            "bad_eager_type": {{
+                                "eager": "{}",
+                                "extra": ["{}", "{}"]
+                            }}
                         }}
                     }}
                 }}
             }}"#,
-            secrets[5], secrets[2], secrets[0], secrets[4], secrets[1], secrets[3]
+            secrets[5],
+            secrets[2],
+            secrets[0],
+            secrets[4],
+            secrets[1],
+            secrets[3],
+            secrets[3],
+            secrets[1],
+            secrets[5],
+            secrets[0],
+            secrets[2],
+            secrets[4]
         )
         .as_bytes(),
     );
@@ -756,5 +800,324 @@ Explicit false rule body.
     assert_eq!(
         sum_items(&inv, CustomizationKind::RuleFile, LoadTiming::Deferred),
         r_model.estimated_tokens + r_false.estimated_tokens
+    );
+}
+
+/// CUST-09: Antigravity MCP tools default to Deferred (Lazy), and only tools configured with
+/// `tools.<name>.eager: true` in matching `mcp_config.json` / `.mcp.json` become Always without
+/// leaking across plugin prefixes.
+#[test]
+fn cust_09_mcp_default_lazy_and_plugin_prefixed_eager() {
+    let tmp = TempDir::new().unwrap();
+    let g = tmp.path();
+
+    // 1. Plugin `google-developer-knowledge` has NO `tools` eager entries -> all tools Deferred.
+    let gdk_dir = g
+        .join("antigravity")
+        .join("mcp")
+        .join("google-developer-knowledge_google-developer-knowledge");
+    let gdk_search = r#"{"name":"search_documents","description":"Search developer docs"}"#;
+    let gdk_get = r#"{"name":"get_documents","description":"Get developer docs"}"#;
+    let gdk_answer = r#"{"name":"answer_query","description":"Answer developer query"}"#;
+    write_file(
+        &gdk_dir.join("search_documents.json"),
+        gdk_search.as_bytes(),
+    );
+    write_file(&gdk_dir.join("get_documents.json"), gdk_get.as_bytes());
+    write_file(&gdk_dir.join("answer_query.json"), gdk_answer.as_bytes());
+    write_file(
+        &g.join("config")
+            .join("plugins")
+            .join("google-developer-knowledge")
+            .join("mcp_config.json"),
+        br#"{"mcpServers":{"google-developer-knowledge":{"serverUrl":"https://example.invalid/mcp"}}}"#,
+    );
+
+    // 2. Plugin `gemini-api` enables `eager: true` on 2 tools and `eager: false` on 1 tool;
+    //    an unlisted tool in the same server directory stays Deferred.
+    let gemini_dir = g
+        .join("antigravity")
+        .join("mcp")
+        .join("gemini-api_gemini-api-docs");
+    let gem_search = r#"{"name":"gemini_search_docs","description":"Search Gemini API docs"}"#;
+    let gem_get = r#"{"name":"gemini_get_doc","description":"Fetch Gemini API doc"}"#;
+    let gem_opt_out = r#"{"name":"gemini_opt_out","description":"Explicitly eager: false"}"#;
+    let gem_unlisted = r#"{"name":"gemini_unlisted","description":"Omitted from tools map"}"#;
+    write_file(
+        &gemini_dir.join("gemini_search_docs.json"),
+        gem_search.as_bytes(),
+    );
+    write_file(&gemini_dir.join("gemini_get_doc.json"), gem_get.as_bytes());
+    write_file(
+        &gemini_dir.join("gemini_opt_out.json"),
+        gem_opt_out.as_bytes(),
+    );
+    write_file(
+        &gemini_dir.join("gemini_unlisted.json"),
+        gem_unlisted.as_bytes(),
+    );
+    write_file(
+        &g.join("config")
+            .join("plugins")
+            .join("gemini-api")
+            .join("mcp_config.json"),
+        br#"{
+            "mcpServers": {
+                "gemini-api-docs": {
+                    "serverUrl": "https://example.invalid/gemini",
+                    "tools": {
+                        "gemini_search_docs": { "eager": true },
+                        "gemini_get_doc": { "eager": true },
+                        "gemini_opt_out": { "eager": false }
+                    }
+                }
+            }
+        }"#,
+    );
+
+    // 3. Same server key `gemini-api-docs` under another plugin and at root must NOT inherit
+    //    `gemini-api` plugin's eager flags.
+    let other_dir = g
+        .join("antigravity")
+        .join("mcp")
+        .join("other-plugin_gemini-api-docs");
+    let other_tool = r#"{"name":"gemini_search_docs","description":"Other plugin tool"}"#;
+    write_file(
+        &other_dir.join("gemini_search_docs.json"),
+        other_tool.as_bytes(),
+    );
+
+    let root_same_srv = g.join("antigravity").join("mcp").join("gemini-api-docs");
+    let root_same_tool = r#"{"name":"gemini_search_docs","description":"Root server tool"}"#;
+    write_file(
+        &root_same_srv.join("gemini_search_docs.json"),
+        root_same_tool.as_bytes(),
+    );
+
+    // 4. Top-level `.mcp.json` with `$schema` scalar and `tools.<name>.eager: true`
+    let top_plugin_dir = g.join("antigravity").join("mcp").join("top-plug_top_srv");
+    let top_eager = r#"{"name":"top_eager_tool","description":"Top-level .mcp.json eager tool"}"#;
+    let top_lazy = r#"{"name":"top_lazy_tool","description":"Top-level .mcp.json lazy tool"}"#;
+    write_file(
+        &top_plugin_dir.join("top_eager_tool.json"),
+        top_eager.as_bytes(),
+    );
+    write_file(
+        &top_plugin_dir.join("top_lazy_tool.json"),
+        top_lazy.as_bytes(),
+    );
+    write_file(
+        &g.join("config")
+            .join("plugins")
+            .join("top-plug")
+            .join(".mcp.json"),
+        br#"{
+            "$schema": "https://example.invalid/schema.json",
+            "top_srv": {
+                "command": "node",
+                "tools": {
+                    "top_eager_tool": { "eager": true }
+                }
+            }
+        }"#,
+    );
+
+    let inv = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    assert!(
+        inv.scan_warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        inv.scan_warnings
+    );
+
+    let find_tool = |source: &str, name: &str| {
+        inv.items
+            .iter()
+            .find(|i| i.kind == CustomizationKind::McpTool && i.source == source && i.name == name)
+            .unwrap_or_else(|| panic!("missing tool {name} in {source}"))
+    };
+
+    assert_eq!(
+        find_tool("mcp:gemini-api_gemini-api-docs", "gemini_search_docs").timing,
+        LoadTiming::Always
+    );
+    assert_eq!(
+        find_tool("mcp:gemini-api_gemini-api-docs", "gemini_get_doc").timing,
+        LoadTiming::Always
+    );
+    assert_eq!(
+        find_tool("mcp:gemini-api_gemini-api-docs", "gemini_opt_out").timing,
+        LoadTiming::Deferred
+    );
+    assert_eq!(
+        find_tool("mcp:gemini-api_gemini-api-docs", "gemini_unlisted").timing,
+        LoadTiming::Deferred
+    );
+
+    for name in ["search_documents", "get_documents", "answer_query"] {
+        assert_eq!(
+            find_tool(
+                "mcp:google-developer-knowledge_google-developer-knowledge",
+                name
+            )
+            .timing,
+            LoadTiming::Deferred
+        );
+    }
+
+    assert_eq!(
+        find_tool("mcp:other-plugin_gemini-api-docs", "gemini_search_docs").timing,
+        LoadTiming::Deferred
+    );
+    assert_eq!(
+        find_tool("mcp:gemini-api-docs", "gemini_search_docs").timing,
+        LoadTiming::Deferred
+    );
+    assert_eq!(
+        find_tool("mcp:top-plug_top_srv", "top_eager_tool").timing,
+        LoadTiming::Always
+    );
+    assert_eq!(
+        find_tool("mcp:top-plug_top_srv", "top_lazy_tool").timing,
+        LoadTiming::Deferred
+    );
+
+    let expected_always =
+        est_text_tokens(gem_search) + est_text_tokens(gem_get) + est_text_tokens(top_eager);
+    let expected_deferred = est_text_tokens(gdk_search)
+        + est_text_tokens(gdk_get)
+        + est_text_tokens(gdk_answer)
+        + est_text_tokens(gem_opt_out)
+        + est_text_tokens(gem_unlisted)
+        + est_text_tokens(other_tool)
+        + est_text_tokens(root_same_tool)
+        + est_text_tokens(top_lazy);
+
+    assert_eq!(inv.breakdown.mcp_tools, expected_always);
+    assert_eq!(inv.breakdown.mcp_deferred, expected_deferred);
+    assert_eq!(
+        sum_items(&inv, CustomizationKind::McpTool, LoadTiming::Always),
+        expected_always
+    );
+    assert_eq!(
+        sum_items(&inv, CustomizationKind::McpTool, LoadTiming::Deferred),
+        expected_deferred
+    );
+}
+
+/// CUST-10: Precedence between plugin / config / antigravity MCP configs, legacy
+/// `lazy`/`defer` compatibility, and `instructions.md` remaining Always.
+#[test]
+fn cust_10_mcp_eager_precedence_and_legacy_lazy_compat() {
+    let tmp = TempDir::new().unwrap();
+    let g = tmp.path();
+
+    let plug_srv = g.join("antigravity").join("mcp").join("my-plug_srv");
+    let instr_body = "Server instructions stay Always even if all tools are deferred.";
+    write_file(&plug_srv.join("instructions.md"), instr_body.as_bytes());
+
+    let overridden_off = r#"{"name":"overridden_off","description":"Plugin eager:true overridden to false by antigravity root"}"#;
+    let overridden_on = r#"{"name":"overridden_on","description":"Config root eager:false overridden to true by antigravity root"}"#;
+    let legacy_lazy = r#"{"name":"legacy_lazy","lazy":true,"description":"Legacy lazy stays Deferred despite eager:true"}"#;
+    let legacy_defer = r#"{"name":"legacy_defer","defer":true,"description":"Legacy defer stays Deferred despite eager:true"}"#;
+    let stem_fallback = r#"{"description":"Tool without JSON name matched by file stem"}"#;
+
+    write_file(
+        &plug_srv.join("overridden_off.json"),
+        overridden_off.as_bytes(),
+    );
+    write_file(
+        &plug_srv.join("overridden_on.json"),
+        overridden_on.as_bytes(),
+    );
+    write_file(&plug_srv.join("legacy_lazy.json"), legacy_lazy.as_bytes());
+    write_file(&plug_srv.join("legacy_defer.json"), legacy_defer.as_bytes());
+    write_file(
+        &plug_srv.join("stem_fallback.json"),
+        stem_fallback.as_bytes(),
+    );
+
+    // Precedence 0 (Plugin): sets overridden_off=true, legacy_lazy=true, legacy_defer=true, stem_fallback=true
+    write_file(
+        &g.join("config")
+            .join("plugins")
+            .join("my-plug")
+            .join("mcp_config.json"),
+        br#"{
+            "mcpServers": {
+                "srv": {
+                    "tools": {
+                        "overridden_off": { "eager": true },
+                        "legacy_lazy": { "eager": true },
+                        "legacy_defer": { "eager": true },
+                        "stem_fallback": { "eager": true }
+                    }
+                }
+            }
+        }"#,
+    );
+
+    // Precedence 1 (config/mcp_config.json): sets overridden_on=false
+    write_file(
+        &g.join("config").join("mcp_config.json"),
+        br#"{
+            "mcpServers": {
+                "my-plug_srv": {
+                    "tools": {
+                        "overridden_on": { "eager": false }
+                    }
+                }
+            }
+        }"#,
+    );
+
+    // Precedence 2 (antigravity/mcp_config.json): overrides overridden_off=false and overridden_on=true
+    write_file(
+        &g.join("antigravity").join("mcp_config.json"),
+        br#"{
+            "mcpServers": {
+                "my-plug_srv": {
+                    "tools": {
+                        "overridden_off": { "eager": false },
+                        "overridden_on": { "eager": true }
+                    }
+                }
+            }
+        }"#,
+    );
+
+    let inv = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    assert!(
+        inv.scan_warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        inv.scan_warnings
+    );
+
+    let find_tool = |name: &str| {
+        inv.items
+            .iter()
+            .find(|i| {
+                i.kind == CustomizationKind::McpTool
+                    && i.source == "mcp:my-plug_srv"
+                    && i.name == name
+            })
+            .unwrap_or_else(|| panic!("missing tool {name}"))
+    };
+
+    assert_eq!(find_tool("overridden_off").timing, LoadTiming::Deferred);
+    assert_eq!(find_tool("overridden_on").timing, LoadTiming::Always);
+    assert_eq!(find_tool("legacy_lazy").timing, LoadTiming::Deferred);
+    assert_eq!(find_tool("legacy_defer").timing, LoadTiming::Deferred);
+    assert_eq!(find_tool("stem_fallback").timing, LoadTiming::Always);
+
+    assert_eq!(inv.breakdown.mcp_instructions, est_text_tokens(instr_body));
+    assert_eq!(
+        inv.breakdown.mcp_tools,
+        est_text_tokens(overridden_on) + est_text_tokens(stem_fallback)
+    );
+    assert_eq!(
+        inv.breakdown.mcp_deferred,
+        est_text_tokens(overridden_off)
+            + est_text_tokens(legacy_lazy)
+            + est_text_tokens(legacy_defer)
     );
 }

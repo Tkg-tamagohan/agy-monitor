@@ -4,7 +4,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use std::fmt;
+
 use serde::Deserialize;
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use crate::analyzer::{CustomizationBreakdown, est_text_tokens};
 use crate::paths::GeminiPaths;
@@ -79,7 +82,13 @@ pub fn scan_customizations_cancellable(
         }
 
         let antigravity_mcp_cfg = antigravity_dir.join("mcp_config.json");
-        if !scan_mcp_config_file(&mut ctx, &antigravity_mcp_cfg, false) {
+        if !scan_mcp_config_file(
+            &mut ctx,
+            &antigravity_mcp_cfg,
+            false,
+            None,
+            PRECEDENCE_ANTIGRAVITY_ROOT,
+        ) {
             return None;
         }
     }
@@ -97,7 +106,13 @@ pub fn scan_customizations_cancellable(
         }
 
         let config_mcp_cfg = config_dir.join("mcp_config.json");
-        if !scan_mcp_config_file(&mut ctx, &config_mcp_cfg, false) {
+        if !scan_mcp_config_file(
+            &mut ctx,
+            &config_mcp_cfg,
+            false,
+            None,
+            PRECEDENCE_CONFIG_ROOT,
+        ) {
             return None;
         }
     }
@@ -109,10 +124,26 @@ pub fn scan_customizations_cancellable(
     Some(ctx.finish())
 }
 
+const PRECEDENCE_PLUGIN: u8 = 0;
+const PRECEDENCE_CONFIG_ROOT: u8 = 1;
+const PRECEDENCE_ANTIGRAVITY_ROOT: u8 = 2;
+
+struct PendingMcpTool {
+    server_name: String,
+    name: String,
+    file_stem: String,
+    source: String,
+    path: PathBuf,
+    estimated_tokens: u64,
+    explicit_deferred: bool,
+}
+
 struct ScanContext<'a> {
     gemini_dir: &'a Path,
     cancel: &'a AtomicBool,
     items: Vec<CustomizationItem>,
+    pending_mcp_tools: Vec<PendingMcpTool>,
+    mcp_tool_eager: HashMap<(String, String), (u8, bool)>,
     breakdown: CustomizationBreakdown,
     mcp_servers: HashSet<String>,
     plugins: HashSet<String>,
@@ -127,6 +158,8 @@ impl<'a> ScanContext<'a> {
             gemini_dir,
             cancel,
             items: Vec::new(),
+            pending_mcp_tools: Vec::new(),
+            mcp_tool_eager: HashMap::new(),
             breakdown: CustomizationBreakdown::default(),
             mcp_servers: HashSet::new(),
             plugins: HashSet::new(),
@@ -134,6 +167,49 @@ impl<'a> ScanContext<'a> {
             files_scanned: 0,
             file_limit_warned: false,
         }
+    }
+
+    fn record_mcp_tool_eager(
+        &mut self,
+        server_key: String,
+        tool_name: String,
+        eager: bool,
+        precedence: u8,
+    ) {
+        let key = (server_key, tool_name);
+        match self.mcp_tool_eager.get_mut(&key) {
+            Some((existing_prec, existing_eager)) => {
+                if precedence >= *existing_prec {
+                    *existing_prec = precedence;
+                    *existing_eager = eager;
+                }
+            }
+            None => {
+                self.mcp_tool_eager.insert(key, (precedence, eager));
+            }
+        }
+    }
+
+    fn lookup_mcp_tool_eager(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        file_stem: &str,
+    ) -> Option<bool> {
+        if let Some((_, eager)) = self
+            .mcp_tool_eager
+            .get(&(server_name.to_string(), tool_name.to_string()))
+        {
+            return Some(*eager);
+        }
+        if file_stem != tool_name
+            && let Some((_, eager)) = self
+                .mcp_tool_eager
+                .get(&(server_name.to_string(), file_stem.to_string()))
+        {
+            return Some(*eager);
+        }
+        None
     }
 
     fn is_cancelled(&self) -> bool {
@@ -341,6 +417,27 @@ impl<'a> ScanContext<'a> {
     }
 
     fn finish(mut self) -> CustomizationInventory {
+        let pending_tools = std::mem::take(&mut self.pending_mcp_tools);
+        for tool in pending_tools {
+            let timing = if tool.explicit_deferred {
+                LoadTiming::Deferred
+            } else if self.lookup_mcp_tool_eager(&tool.server_name, &tool.name, &tool.file_stem)
+                == Some(true)
+            {
+                LoadTiming::Always
+            } else {
+                LoadTiming::Deferred
+            };
+            self.push_item(CustomizationItem {
+                kind: CustomizationKind::McpTool,
+                timing,
+                name: tool.name,
+                source: tool.source,
+                path: tool.path,
+                estimated_tokens: tool.estimated_tokens,
+            });
+        }
+
         self.items.sort_by(|a, b| {
             b.estimated_tokens
                 .cmp(&a.estimated_tokens)
@@ -380,9 +477,234 @@ struct McpToolMetadata {
 #[derive(Deserialize)]
 struct McpConfigKeysOnly {
     #[serde(default, rename = "mcpServers")]
-    mcp_servers: Option<HashMap<String, serde::de::IgnoredAny>>,
+    mcp_servers: Option<HashMap<String, McpServerConfigSafe>>,
     #[serde(flatten)]
-    top_level: HashMap<String, serde::de::IgnoredAny>,
+    top_level: HashMap<String, McpServerConfigSafe>,
+}
+
+fn drain_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
+    while seq.next_element::<IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+fn drain_map<'de, A: MapAccess<'de>>(mut map: A) -> Result<(), A::Error> {
+    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+#[derive(Default)]
+struct McpServerConfigSafe {
+    tool_eager: HashMap<String, bool>,
+}
+
+impl<'de> Deserialize<'de> for McpServerConfigSafe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ServerVisitor;
+        impl<'de> Visitor<'de> for ServerVisitor {
+            type Value = McpServerConfigSafe;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("MCP server configuration object")
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                drain_seq(seq)?;
+                Ok(Self::Value::default())
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut tool_eager = HashMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "tools" {
+                        tool_eager = map.next_value::<McpToolsMapSafe>()?.0;
+                    } else {
+                        let _ = map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(McpServerConfigSafe { tool_eager })
+            }
+        }
+        deserializer.deserialize_any(ServerVisitor)
+    }
+}
+
+#[derive(Default)]
+struct McpToolsMapSafe(HashMap<String, bool>);
+
+impl<'de> Deserialize<'de> for McpToolsMapSafe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ToolsMapVisitor;
+        impl<'de> Visitor<'de> for ToolsMapVisitor {
+            type Value = McpToolsMapSafe;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("MCP tools map")
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                drain_seq(seq)?;
+                Ok(Self::Value::default())
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut out = HashMap::new();
+                while let Some(raw_name) = map.next_key::<String>()? {
+                    let entry = map.next_value::<McpToolEntrySafe>()?;
+                    if let Some(eager) = entry.eager {
+                        let trimmed = raw_name.trim();
+                        if !trimmed.is_empty() {
+                            out.insert(trimmed.to_string(), eager);
+                        }
+                    }
+                }
+                Ok(McpToolsMapSafe(out))
+            }
+        }
+        deserializer.deserialize_any(ToolsMapVisitor)
+    }
+}
+
+#[derive(Default)]
+struct McpToolEntrySafe {
+    eager: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for McpToolEntrySafe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EntryVisitor;
+        impl<'de> Visitor<'de> for EntryVisitor {
+            type Value = McpToolEntrySafe;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("MCP tool entry object")
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(Self::Value::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                drain_seq(seq)?;
+                Ok(Self::Value::default())
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut eager = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "eager" {
+                        eager = map.next_value::<OptionalBoolSafe>()?.0;
+                    } else {
+                        let _ = map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(McpToolEntrySafe { eager })
+            }
+        }
+        deserializer.deserialize_any(EntryVisitor)
+    }
+}
+
+#[derive(Default)]
+struct OptionalBoolSafe(Option<bool>);
+
+impl<'de> Deserialize<'de> for OptionalBoolSafe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BoolVisitor;
+        impl<'de> Visitor<'de> for BoolVisitor {
+            type Value = OptionalBoolSafe;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("optional boolean")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(Some(v)))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                drain_seq(seq)?;
+                Ok(OptionalBoolSafe(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                drain_map(map)?;
+                Ok(OptionalBoolSafe(None))
+            }
+        }
+        deserializer.deserialize_any(BoolVisitor)
+    }
 }
 
 fn classify_json_error(err: &serde_json::Error) -> &'static str {
@@ -484,24 +806,22 @@ fn scan_mcp_server_dir(
                     continue;
                 }
             };
-            let timing = if meta.lazy == Some(true) || meta.defer == Some(true) {
-                LoadTiming::Deferred
-            } else {
-                LoadTiming::Always
-            };
+            let explicit_deferred = meta.lazy == Some(true) || meta.defer == Some(true);
+            let file_stem = file_stem_or_name(&path);
             let name = meta
                 .name
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| file_stem_or_name(&path));
+                .unwrap_or_else(|| file_stem.clone());
             let estimated_tokens = est_text_tokens(&text);
-            ctx.push_item(CustomizationItem {
-                kind: CustomizationKind::McpTool,
-                timing,
+            ctx.pending_mcp_tools.push(PendingMcpTool {
+                server_name: server_name.to_string(),
                 name,
+                file_stem,
                 source: source.clone(),
                 path,
                 estimated_tokens,
+                explicit_deferred,
             });
         }
     }
@@ -642,14 +962,20 @@ fn scan_plugins_dir(ctx: &mut ScanContext<'_>, plugins_dir: &Path, depth: usize)
         for mcp_file in [".mcp.json", "mcp_config.json", "mcp.json"] {
             let path = plugin_path.join(mcp_file);
             let allow_top_level = mcp_file == ".mcp.json";
-            if !scan_mcp_config_file(ctx, &path, allow_top_level) {
+            if !scan_mcp_config_file(
+                ctx,
+                &path,
+                allow_top_level,
+                Some(&plugin_name),
+                PRECEDENCE_PLUGIN,
+            ) {
                 return false;
             }
         }
 
         let plugin_mcp_dir = plugin_path.join("mcp");
         if ctx.enter_dir(&plugin_mcp_dir)
-            && !scan_plugin_mcp_dir(ctx, &plugin_mcp_dir, plugin_depth + 1)
+            && !scan_plugin_mcp_dir(ctx, &plugin_name, &plugin_mcp_dir, plugin_depth + 1)
         {
             return false;
         }
@@ -774,7 +1100,12 @@ fn scan_plugin_agents_dir(
     true
 }
 
-fn scan_plugin_mcp_dir(ctx: &mut ScanContext<'_>, mcp_dir: &Path, depth: usize) -> bool {
+fn scan_plugin_mcp_dir(
+    ctx: &mut ScanContext<'_>,
+    plugin_name: &str,
+    mcp_dir: &Path,
+    depth: usize,
+) -> bool {
     if depth > MAX_SCAN_DEPTH {
         let rel = ctx.rel_display(mcp_dir);
         ctx.push_warning(format!(
@@ -799,12 +1130,18 @@ fn scan_plugin_mcp_dir(ctx: &mut ScanContext<'_>, mcp_dir: &Path, depth: usize) 
         if ft.is_file() {
             if name == ".mcp.json" || name == "mcp_config.json" || name == "mcp.json" {
                 let allow_top_level = name == ".mcp.json";
-                if !scan_mcp_config_file(ctx, &path, allow_top_level) {
+                if !scan_mcp_config_file(
+                    ctx,
+                    &path,
+                    allow_top_level,
+                    Some(plugin_name),
+                    PRECEDENCE_PLUGIN,
+                ) {
                     return false;
                 }
             } else if !is_node_bundle
                 && has_ascii_extension(&path, "json")
-                && !scan_mcp_config_file(ctx, &path, false)
+                && !scan_mcp_config_file(ctx, &path, false, Some(plugin_name), PRECEDENCE_PLUGIN)
             {
                 return false;
             }
@@ -822,7 +1159,13 @@ fn is_ignored_code_subdir(name: &str) -> bool {
     )
 }
 
-fn scan_mcp_config_file(ctx: &mut ScanContext<'_>, path: &Path, allow_top_level: bool) -> bool {
+fn scan_mcp_config_file(
+    ctx: &mut ScanContext<'_>,
+    path: &Path,
+    allow_top_level: bool,
+    plugin_prefix: Option<&str>,
+    precedence: u8,
+) -> bool {
     let text = match ctx.read_safe_utf8_file(path) {
         ReadOutcome::Ok(t) => t,
         ReadOutcome::Cancelled => return false,
@@ -841,20 +1184,35 @@ fn scan_mcp_config_file(ctx: &mut ScanContext<'_>, path: &Path, allow_top_level:
         }
     };
 
+    let mut register_servers = |servers: HashMap<String, McpServerConfigSafe>,
+                                skip_dollar: bool| {
+        for (key, server_cfg) in servers {
+            let trimmed = key.trim();
+            if trimmed.is_empty() || (skip_dollar && trimmed.starts_with('$')) {
+                continue;
+            }
+            ctx.mcp_servers.insert(trimmed.to_string());
+            if !server_cfg.tool_eager.is_empty() {
+                let server_lookup_key = match plugin_prefix {
+                    Some(prefix) => format!("{prefix}_{trimmed}"),
+                    None => trimmed.to_string(),
+                };
+                for (tool_name, eager) in server_cfg.tool_eager {
+                    ctx.record_mcp_tool_eager(
+                        server_lookup_key.clone(),
+                        tool_name,
+                        eager,
+                        precedence,
+                    );
+                }
+            }
+        }
+    };
+
     if let Some(servers) = parsed.mcp_servers {
-        for key in servers.into_keys() {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() {
-                ctx.mcp_servers.insert(trimmed.to_string());
-            }
-        }
+        register_servers(servers, false);
     } else if allow_top_level {
-        for key in parsed.top_level.into_keys() {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with('$') {
-                ctx.mcp_servers.insert(trimmed.to_string());
-            }
-        }
+        register_servers(parsed.top_level, true);
     }
 
     true
