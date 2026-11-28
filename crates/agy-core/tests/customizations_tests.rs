@@ -5,7 +5,8 @@ use std::sync::atomic::AtomicBool;
 use agy_core::analyzer::est_text_tokens;
 use agy_core::customizations::{
     CustomizationInventory, CustomizationKind, LoadTiming, MAX_FILE_BYTES, MAX_SCAN_DEPTH,
-    MAX_SCAN_FILES, MAX_WARNINGS, scan_customizations, scan_customizations_cancellable,
+    MAX_SCAN_FILES, MAX_STAT_PROBES, MAX_WARNINGS, scan_customizations,
+    scan_customizations_cancellable,
 };
 use agy_core::paths::GeminiPaths;
 use tempfile::TempDir;
@@ -1303,5 +1304,75 @@ fn cust_12_missing_optional_mcp_configs_do_not_consume_file_limit() {
             .iter()
             .any(|i| i.kind == CustomizationKind::SkillIndex && i.name == "exact_skill"),
         "skill beyond MAX_SCAN_FILES should be skipped"
+    );
+}
+
+/// CUST-13: Hitting MAX_STAT_PROBES (8,000) keeps the 8,000th successful probe entry,
+/// skips the 8,001st probe, and emits the distinct stat-probe limit warning instead of
+/// misreporting MAX_SCAN_FILES (2,000).
+#[test]
+fn cust_13_stat_probe_exact_boundary_keeps_8000th_and_warns_distinctly() {
+    let tmp = TempDir::new().unwrap();
+    let g = tmp.path();
+
+    // Pre-probes before tools:
+    // enter_dir(antigravity)=1, enter_dir(config)=1, read(antigravity/mcp_config.json)=1,
+    // read(config/mcp_config.json)=1, enter_dir(config/plugins)=1,
+    // 1500 empty plugins * (3 config probes + 1 enter_dir(mcp)) = 6000,
+    // enter_dir(antigravity/mcp)=1 -> total 6006 probes.
+    let plugins_dir = g.join("config").join("plugins");
+    fs::create_dir_all(&plugins_dir).unwrap();
+    for i in 0..1500 {
+        fs::create_dir_all(plugins_dir.join(format!("p_{i:04}"))).unwrap();
+    }
+
+    let srv_dir = g.join("antigravity").join("mcp").join("srv");
+    fs::create_dir_all(&srv_dir).unwrap();
+    let pre_probes = 1 + 1 + 1 + 1 + 1 + (1500 * 4) + 1;
+    let keep_count = MAX_STAT_PROBES - pre_probes; // 8000 - 6006 = 1994 (< MAX_SCAN_FILES)
+    assert!(keep_count < MAX_SCAN_FILES);
+
+    for i in 0..keep_count {
+        let body = if i == keep_count - 1 {
+            r#"{"name":"probe_8000_tool","description":"8000th probe should be kept"}"#
+        } else {
+            r#"{"name":"x"}"#
+        };
+        fs::write(srv_dir.join(format!("t_{i:04}.json")), body).unwrap();
+    }
+    fs::write(
+        srv_dir.join(format!("t_{keep_count:04}.json")),
+        br#"{"name":"probe_8001_tool","description":"8001st probe should be skipped"}"#,
+    )
+    .unwrap();
+
+    let inv = scan_customizations(&GeminiPaths::from_gemini_dir(g));
+    let mcp_tools: Vec<_> = inv
+        .items
+        .iter()
+        .filter(|i| i.kind == CustomizationKind::McpTool)
+        .collect();
+    assert_eq!(mcp_tools.len(), keep_count);
+    assert!(
+        mcp_tools.iter().any(|i| i.name == "probe_8000_tool"),
+        "8000th stat probe tool must be preserved"
+    );
+    assert!(
+        !mcp_tools.iter().any(|i| i.name == "probe_8001_tool"),
+        "8001st stat probe tool must be skipped"
+    );
+    assert!(
+        inv.scan_warnings.iter().any(|w| w.contains(&format!(
+            "scan stat probe limit reached ({MAX_STAT_PROBES})"
+        ))),
+        "expected stat probe limit warning, got: {:?}",
+        inv.scan_warnings
+    );
+    assert!(
+        !inv.scan_warnings
+            .iter()
+            .any(|w| w.contains("scan file limit reached")),
+        "must not emit file limit warning when stat probe limit hit first: {:?}",
+        inv.scan_warnings
     );
 }

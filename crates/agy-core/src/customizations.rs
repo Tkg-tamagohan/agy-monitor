@@ -13,6 +13,7 @@ use crate::analyzer::{CustomizationBreakdown, est_text_tokens};
 use crate::paths::GeminiPaths;
 
 pub const MAX_SCAN_FILES: usize = 2000;
+pub const MAX_STAT_PROBES: usize = MAX_SCAN_FILES * 4;
 pub const MAX_FILE_BYTES: u64 = 512 * 1024;
 pub const MAX_SCAN_DEPTH: usize = 8;
 pub const MAX_WARNINGS: usize = 50;
@@ -119,7 +120,7 @@ pub fn scan_customizations_cancellable(
             if ctx.is_cancelled() {
                 return None;
             }
-            if ctx.hit_file_limit() {
+            if ctx.hit_any_limit() {
                 break;
             }
             if !ft.is_dir() {
@@ -181,7 +182,7 @@ pub fn scan_customizations_cancellable(
             if ctx.is_cancelled() {
                 return None;
             }
-            if ctx.hit_file_limit() {
+            if ctx.hit_any_limit() {
                 break;
             }
             if !ft.is_dir() {
@@ -225,7 +226,6 @@ pub fn scan_customizations_cancellable(
 const PRECEDENCE_PLUGIN: u8 = 0;
 const PRECEDENCE_CONFIG_ROOT: u8 = 1;
 const PRECEDENCE_ANTIGRAVITY_ROOT: u8 = 2;
-const MAX_STAT_PROBES: usize = MAX_SCAN_FILES * 4;
 
 struct ScanContext<'a> {
     gemini_dir: &'a Path,
@@ -239,6 +239,7 @@ struct ScanContext<'a> {
     files_scanned: usize,
     stat_probes: usize,
     file_limit_warned: bool,
+    stat_limit_warned: bool,
 }
 
 impl<'a> ScanContext<'a> {
@@ -255,6 +256,7 @@ impl<'a> ScanContext<'a> {
             files_scanned: 0,
             stat_probes: 0,
             file_limit_warned: false,
+            stat_limit_warned: false,
         }
     }
 
@@ -315,8 +317,12 @@ impl<'a> ScanContext<'a> {
         self.cancel.load(Ordering::Relaxed)
     }
 
-    fn limit_reached(&self) -> bool {
-        self.files_scanned >= MAX_SCAN_FILES || self.stat_probes >= MAX_STAT_PROBES
+    fn file_limit_reached(&self) -> bool {
+        self.files_scanned >= MAX_SCAN_FILES
+    }
+
+    fn stat_limit_reached(&self) -> bool {
+        self.stat_probes >= MAX_STAT_PROBES
     }
 
     fn warn_file_limit_once(&mut self) {
@@ -328,9 +334,40 @@ impl<'a> ScanContext<'a> {
         }
     }
 
+    fn warn_stat_limit_once(&mut self) {
+        if !self.stat_limit_warned {
+            self.stat_limit_warned = true;
+            self.push_warning(format!(
+                "scan stat probe limit reached ({MAX_STAT_PROBES}); remaining entries skipped"
+            ));
+        }
+    }
+
+    fn try_reserve_stat_probe(&mut self) -> bool {
+        if self.stat_limit_reached() {
+            self.warn_stat_limit_once();
+            false
+        } else {
+            self.stat_probes += 1;
+            true
+        }
+    }
+
     fn hit_file_limit(&mut self) -> bool {
-        if self.limit_reached() {
+        if self.file_limit_reached() {
             self.warn_file_limit_once();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn hit_any_limit(&mut self) -> bool {
+        if self.file_limit_reached() {
+            self.warn_file_limit_once();
+            true
+        } else if self.stat_limit_reached() {
+            self.warn_stat_limit_once();
             true
         } else {
             false
@@ -384,29 +421,26 @@ impl<'a> ScanContext<'a> {
     }
 
     fn enter_dir(&mut self, path: &Path) -> bool {
-        if self.is_cancelled() {
+        if self.is_cancelled() || !self.try_reserve_stat_probe() {
             return false;
         }
-        if self.stat_probes >= MAX_STAT_PROBES {
-            self.warn_file_limit_once();
-            return false;
-        }
-        self.stat_probes += 1;
         match std::fs::symlink_metadata(path) {
             Ok(meta) => {
-                if self.hit_file_limit() {
-                    return false;
-                }
                 if meta.file_type().is_symlink() {
-                    let rel = self.rel_display(path);
-                    self.push_warning(format!("{rel}: skipped symlink directory"));
+                    if !self.file_limit_reached() {
+                        let rel = self.rel_display(path);
+                        self.push_warning(format!("{rel}: skipped symlink directory"));
+                    }
                     return false;
                 }
-                meta.file_type().is_dir()
+                if !meta.file_type().is_dir() {
+                    return false;
+                }
+                !self.hit_file_limit()
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
             Err(err) => {
-                if !self.limit_reached() {
+                if !self.file_limit_reached() {
                     let rel = self.rel_display(path);
                     self.push_warning(format!(
                         "{rel}: failed to stat directory ({:?})",
@@ -472,11 +506,9 @@ impl<'a> ScanContext<'a> {
         if self.is_cancelled() {
             return ReadOutcome::Cancelled;
         }
-        if self.stat_probes >= MAX_STAT_PROBES {
-            self.warn_file_limit_once();
+        if !self.try_reserve_stat_probe() {
             return ReadOutcome::LimitReached;
         }
-        self.stat_probes += 1;
 
         let meta = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
@@ -834,7 +866,7 @@ fn scan_antigravity_mcp(ctx: &mut ScanContext<'_>, mcp_dir: &Path, depth: usize)
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.hit_file_limit() {
+        if ctx.hit_any_limit() {
             break;
         }
         if !ft.is_dir() {
@@ -869,7 +901,7 @@ fn scan_mcp_server_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.hit_file_limit() {
+        if ctx.hit_any_limit() {
             break;
         }
         if ft.is_dir() {
@@ -964,7 +996,7 @@ fn scan_skills_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.hit_file_limit() {
+        if ctx.hit_any_limit() {
             break;
         }
         if !ft.is_dir() {
@@ -1054,7 +1086,7 @@ fn scan_plugin_rules_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.hit_file_limit() {
+        if ctx.hit_any_limit() {
             break;
         }
         if ft.is_dir() {
@@ -1111,7 +1143,7 @@ fn scan_plugin_agents_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.hit_file_limit() {
+        if ctx.hit_any_limit() {
             break;
         }
         if ft.is_dir() {
@@ -1175,7 +1207,7 @@ fn scan_plugin_mcp_dir(
         if ctx.is_cancelled() {
             return false;
         }
-        if ctx.hit_file_limit() {
+        if ctx.hit_any_limit() {
             break;
         }
         if ft.is_file() {
